@@ -1,0 +1,11 @@
+[package]
+name = "nyx-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+html5ever.workspace = true
+scraper.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true

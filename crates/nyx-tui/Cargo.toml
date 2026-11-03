@@ -1,0 +1,14 @@
+[package]
+name = "nyx-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm.workspace = true
+image.workspace = true
+nyx-core = { path = "../nyx-core" }
+nyx-pal = { path = "../nyx-pal" }
+ratatui.workspace = true
+rpassword.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
