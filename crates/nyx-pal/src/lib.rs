@@ -19,7 +19,7 @@ use rand_core::RngCore;
 use reqwest::{
     cookie::CookieStore as ReqwestCookieStore,
     header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT},
-    Client,
+    Client, NoProxy, Proxy,
 };
 use thiserror::Error;
 use url::Url;
@@ -36,6 +36,8 @@ const SEARCH_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const MAX_IMAGE_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
+const TOR_BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0";
 type DecryptedVault = (
     [u8; VAULT_SALT_LEN],
     Zeroizing<[u8; VAULT_KEY_LEN]>,
@@ -52,6 +54,10 @@ pub enum AdapterError {
     Http(#[from] reqwest::Error),
     #[error("image response exceeded the {limit}-byte limit")]
     ResponseTooLarge { limit: usize },
+    #[error("Tor proxy must be a valid socks5h:// endpoint")]
+    InvalidTorProxy,
+    #[error("Tor route could not be verified by the Tor Project check endpoint")]
+    TorRouteNotVerified,
     #[error("search provider rate limited requests; retry after {retry_after:?}")]
     RateLimited { retry_after: Duration },
     #[error("invalid response cookie: {0}")]
@@ -268,16 +274,43 @@ pub struct StdBackend {
     cookie_jar: Arc<NyxCookieJar>,
     vault: Option<Arc<SessionVault>>,
     search_rate_limiter: Arc<SearchRateLimiter>,
+    tor_route: Option<Arc<TorRouteState>>,
+}
+
+#[derive(Debug, Default)]
+struct TorRouteState {
+    verified: std::sync::atomic::AtomicBool,
+    connected: std::sync::atomic::AtomicBool,
 }
 
 impl StdBackend {
     pub fn new() -> Result<Self, AdapterError> {
-        Self::with_store(CookieStore::default(), None)
+        Self::with_store(CookieStore::default(), None, None)
+    }
+
+    pub fn new_with_tor_proxy(proxy_url: &str) -> Result<Self, AdapterError> {
+        Self::with_store(CookieStore::default(), None, Some(proxy_url))
     }
 
     pub fn open_session_vault(
         path: impl Into<PathBuf>,
         passphrase: &str,
+    ) -> Result<(Self, bool), AdapterError> {
+        Self::open_session_vault_with_proxy(path, passphrase, None)
+    }
+
+    pub fn open_session_vault_with_tor_proxy(
+        path: impl Into<PathBuf>,
+        passphrase: &str,
+        proxy_url: &str,
+    ) -> Result<(Self, bool), AdapterError> {
+        Self::open_session_vault_with_proxy(path, passphrase, Some(proxy_url))
+    }
+
+    fn open_session_vault_with_proxy(
+        path: impl Into<PathBuf>,
+        passphrase: &str,
+        proxy_url: Option<&str>,
     ) -> Result<(Self, bool), AdapterError> {
         let path = path.into();
         let is_new = !path.exists();
@@ -301,7 +334,44 @@ impl StdBackend {
             fs::create_dir_all(parent)?;
         }
         let vault = Arc::new(SessionVault { path, salt, key });
-        Ok((Self::with_store(store, Some(vault))?, is_new))
+        Ok((Self::with_store(store, Some(vault), proxy_url)?, is_new))
+    }
+
+    pub fn tor_proxy_configured(&self) -> bool {
+        self.tor_route.is_some()
+    }
+
+    pub fn tor_route_connected(&self) -> bool {
+        self.tor_route
+            .as_ref()
+            .is_some_and(|status| status.connected.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub async fn verify_tor_route(&self) -> Result<(), AdapterError> {
+        let response = self
+            .send_request(self.client.get("https://check.torproject.org/api/ip"))
+            .await?;
+        let is_tor = serde_json::from_str::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|value| value.get("IsTor")?.as_bool())
+            .unwrap_or(false);
+        if !is_tor {
+            if let Some(status) = &self.tor_route {
+                status
+                    .connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Err(AdapterError::TorRouteNotVerified);
+        }
+        if let Some(status) = &self.tor_route {
+            status
+                .verified
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            status
+                .connected
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     pub fn default_session_vault_path() -> Result<PathBuf, AdapterError> {
@@ -344,29 +414,50 @@ impl StdBackend {
     fn with_store(
         store: CookieStore,
         vault: Option<Arc<SessionVault>>,
+        proxy_url: Option<&str>,
     ) -> Result<Self, AdapterError> {
         let cookie_jar = Arc::new(NyxCookieJar::new(store));
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(USER_AGENT, HeaderValue::from_static(DESKTOP_USER_AGENT));
+        default_headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(if proxy_url.is_some() {
+                TOR_BROWSER_USER_AGENT
+            } else {
+                DESKTOP_USER_AGENT
+            }),
+        );
         default_headers.insert(
             ACCEPT,
             HeaderValue::from_static(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                if proxy_url.is_some() {
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                } else {
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                },
             ),
         );
-        default_headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
         default_headers.insert(
-            "sec-ch-ua",
-            HeaderValue::from_static(
-                "\"Chromium\";v=\"122\", \"Google Chrome\";v=\"122\", \"Not(A:Brand\";v=\"24\"",
-            ),
+            ACCEPT_LANGUAGE,
+            HeaderValue::from_static(if proxy_url.is_some() {
+                "en-US,en;q=0.5"
+            } else {
+                "en-US,en;q=0.9"
+            }),
         );
-        default_headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
-        default_headers.insert(
-            "sec-ch-ua-platform",
-            HeaderValue::from_static("\"Windows\""),
-        );
-        let client = Client::builder()
+        if proxy_url.is_none() {
+            default_headers.insert(
+                "sec-ch-ua",
+                HeaderValue::from_static(
+                    "\"Chromium\";v=\"122\", \"Google Chrome\";v=\"122\", \"Not(A:Brand\";v=\"24\"",
+                ),
+            );
+            default_headers.insert("sec-ch-ua-mobile", HeaderValue::from_static("?0"));
+            default_headers.insert(
+                "sec-ch-ua-platform",
+                HeaderValue::from_static("\"Windows\""),
+            );
+        }
+        let mut builder = Client::builder()
             .default_headers(default_headers)
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -381,13 +472,32 @@ impl StdBackend {
                     attempt.follow()
                 }
             }))
-            .cookie_provider(Arc::clone(&cookie_jar))
-            .build()?;
+            .cookie_provider(Arc::clone(&cookie_jar));
+        let tor_route = if let Some(proxy_url) = proxy_url {
+            let proxy = Url::parse(proxy_url).map_err(|_| AdapterError::InvalidTorProxy)?;
+            if proxy.scheme() != "socks5h"
+                || proxy.host_str().is_none()
+                || proxy.port_or_known_default().is_none()
+                || !proxy.username().is_empty()
+                || proxy.password().is_some()
+            {
+                return Err(AdapterError::InvalidTorProxy);
+            }
+            let proxy = Proxy::all(proxy_url)
+                .map_err(|_| AdapterError::InvalidTorProxy)?
+                .no_proxy(NoProxy::from_string("localhost,127.0.0.1,::1"));
+            builder = builder.no_proxy().proxy(proxy);
+            Some(Arc::new(TorRouteState::default()))
+        } else {
+            None
+        };
+        let client = builder.build()?;
         Ok(Self {
             client,
             cookie_jar,
             vault,
             search_rate_limiter: Arc::new(SearchRateLimiter::default()),
+            tor_route,
         })
     }
 }
@@ -395,6 +505,7 @@ impl StdBackend {
 impl NetworkAdapter for StdBackend {
     fn fetch<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, String> {
         Box::pin(async move {
+            self.ensure_tor_route_verified()?;
             let parsed_url =
                 Url::parse(url).map_err(|error| AdapterError::InvalidUrl(error.to_string()))?;
             let origin = parsed_url.origin().ascii_serialization();
@@ -405,11 +516,17 @@ impl NetworkAdapter for StdBackend {
     }
 
     fn fetch_page<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, PageResponse> {
-        Box::pin(async move { self.send_request(self.client.get(url)).await })
+        Box::pin(async move {
+            self.ensure_tor_route_verified()?;
+            self.send_request(self.client.get(url)).await
+        })
     }
 
     fn fetch_bytes<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, Vec<u8>> {
-        Box::pin(async move { self.send_bytes_request(self.client.get(url)).await })
+        Box::pin(async move {
+            self.ensure_tor_route_verified()?;
+            self.send_bytes_request(self.client.get(url)).await
+        })
     }
 
     fn submit_form<'a>(
@@ -417,6 +534,7 @@ impl NetworkAdapter for StdBackend {
         submission: &'a FormSubmission,
     ) -> AdapterFuture<'a, PageResponse> {
         Box::pin(async move {
+            self.ensure_tor_route_verified()?;
             let request = match submission.method {
                 FormRequestMethod::Get => {
                     let mut url = Url::parse(&submission.url)
@@ -439,11 +557,35 @@ impl NetworkAdapter for StdBackend {
 }
 
 impl StdBackend {
+    fn ensure_tor_route_verified(&self) -> Result<(), AdapterError> {
+        if self
+            .tor_route
+            .as_ref()
+            .is_some_and(|status| !status.verified.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(AdapterError::TorRouteNotVerified);
+        }
+        Ok(())
+    }
+
     async fn send_bytes_request(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<Vec<u8>, AdapterError> {
-        let response = request.send().await?;
+        let request = request.build()?;
+        let uses_tor = self.tor_route.is_some() && !is_local_destination(request.url());
+        let response = match self.client.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                if uses_tor {
+                    self.set_tor_route_connected(false);
+                }
+                return Err(AdapterError::Http(error));
+            }
+        };
+        if uses_tor {
+            self.set_tor_route_connected(true);
+        }
         let url = response.url().clone();
         let status = response.status();
         let status_error = response.error_for_status_ref().err();
@@ -501,7 +643,20 @@ impl StdBackend {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<PageResponse, AdapterError> {
-        let response = request.send().await?;
+        let request = request.build()?;
+        let uses_tor = self.tor_route.is_some() && !is_local_destination(request.url());
+        let response = match self.client.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                if uses_tor {
+                    self.set_tor_route_connected(false);
+                }
+                return Err(AdapterError::Http(error));
+            }
+        };
+        if uses_tor {
+            self.set_tor_route_connected(true);
+        }
         let url = response.url().clone();
         let status = response.status();
         let status_error = response.error_for_status_ref().err();
@@ -533,6 +688,23 @@ impl StdBackend {
             url,
             body: body_result?,
         })
+    }
+
+    fn set_tor_route_connected(&self, connected: bool) {
+        if let Some(status) = &self.tor_route {
+            status
+                .connected
+                .store(connected, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+fn is_local_destination(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -752,13 +924,135 @@ fn active_core_index() -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FormRequestMethod, FormSubmission, NetworkAdapter, ReqwestCookieStore, StdBackend,
-        DESKTOP_USER_AGENT,
+        AdapterError, FormRequestMethod, FormSubmission, NetworkAdapter, ReqwestCookieStore,
+        StdBackend, DESKTOP_USER_AGENT, TOR_BROWSER_USER_AGENT,
     };
     use reqwest::header::HeaderValue;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use url::Url;
+
+    #[tokio::test]
+    async fn tor_mode_requires_socks5h_and_blocks_requests_until_verified(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            StdBackend::new_with_tor_proxy("http://127.0.0.1:9050"),
+            Err(AdapterError::InvalidTorProxy)
+        ));
+
+        let backend = StdBackend::new_with_tor_proxy("socks5h://127.0.0.1:9050")?;
+        assert!(backend.tor_proxy_configured());
+        assert!(!backend.tor_route_connected());
+        assert!(matches!(
+            backend.fetch_page("https://example.com/").await,
+            Err(AdapterError::TorRouteNotVerified)
+        ));
+        assert!(!backend.tor_route_connected());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tor_verification_uses_the_configured_socks_proxy(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut handshake = [0; 2];
+            stream.read_exact(&mut handshake).await?;
+            let mut methods = vec![0; usize::from(handshake[1])];
+            stream.read_exact(&mut methods).await?;
+            stream.write_all(&[5, 0]).await?;
+
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await?;
+            if request[3] != 3 {
+                return Err(std::io::Error::other("expected remote DNS hostname"));
+            }
+            let mut hostname_length = [0; 1];
+            stream.read_exact(&mut hostname_length).await?;
+            let mut hostname = vec![0; usize::from(hostname_length[0])];
+            stream.read_exact(&mut hostname).await?;
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await?;
+            stream.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+            String::from_utf8(hostname).map_err(std::io::Error::other)
+        });
+
+        let backend = StdBackend::new_with_tor_proxy(&format!("socks5h://{address}"))?;
+        assert!(backend.verify_tor_route().await.is_err());
+        assert_eq!(proxy.await??, "check.torproject.org");
+        assert!(!backend.tor_route_connected());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_service_requests_do_not_mark_the_tor_route_connected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let _ = read_request(&mut stream).await?;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let backend = StdBackend::new_with_tor_proxy("socks5h://127.0.0.1:9050")?;
+        let tor_route = backend
+            .tor_route
+            .as_ref()
+            .ok_or("Tor route state was not initialized")?;
+        tor_route
+            .verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let page = backend
+            .fetch_page(&format!("http://{address}/search"))
+            .await?;
+        assert_eq!(page.body, "ok");
+        assert!(!backend.tor_route_connected());
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tor_mode_omits_chromium_client_hints() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_request(&mut stream).await?;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await?;
+            Ok::<_, std::io::Error>(request)
+        });
+
+        let backend = StdBackend::new_with_tor_proxy("socks5h://127.0.0.1:9050")?;
+        let tor_route = backend
+            .tor_route
+            .as_ref()
+            .ok_or("Tor route state was not initialized")?;
+        tor_route
+            .verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        backend
+            .fetch_page(&format!("http://{address}/page"))
+            .await?;
+        let request = String::from_utf8_lossy(&server.await??).to_ascii_lowercase();
+
+        assert!(request.contains(&format!(
+            "user-agent: {}",
+            TOR_BROWSER_USER_AGENT.to_ascii_lowercase()
+        )));
+        assert!(!request.contains("sec-ch-ua:"));
+        assert!(request.contains("accept-language: en-us,en;q=0.5"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn http_client_sends_user_agent_and_returns_response_body(

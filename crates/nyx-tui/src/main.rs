@@ -29,6 +29,8 @@ use std::io::Cursor;
 use tokio::sync::mpsc;
 use zeroize::{Zeroize, Zeroizing};
 
+const DEFAULT_TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
+
 struct SearchCompletion {
     query: String,
     result: Result<Vec<SearchResult>, String>,
@@ -42,6 +44,15 @@ struct ImageViewer {
 enum ActiveModal<'a> {
     Form(&'a FormSession),
     Image(&'a ImageViewer),
+}
+
+struct UiContext<'a> {
+    selected_link: usize,
+    show_help: bool,
+    notice: Option<&'a str>,
+    modal: Option<ActiveModal<'a>>,
+    tor_configured: bool,
+    tor_connected: bool,
 }
 
 #[derive(Debug)]
@@ -132,6 +143,16 @@ impl Drop for TerminalSession {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let tor_proxy = std::env::var_os("NYX_TOR_SOCKS")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| "NYX_TOR_SOCKS must be valid Unicode")
+        })
+        .transpose()?;
+    let tor_proxy_url = tor_proxy
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOR_PROXY.to_owned());
     let vault_path = StdBackend::default_session_vault_path()?;
     let vault_exists = vault_path.exists();
     let prompt = if vault_exists {
@@ -150,21 +171,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("session vault passphrases do not match".into());
         }
     }
-    let (backend, _) = StdBackend::open_session_vault(&vault_path, passphrase.as_str())?;
+    let (mut backend, _) = match tor_proxy.as_deref() {
+        Some(proxy) => {
+            StdBackend::open_session_vault_with_tor_proxy(&vault_path, passphrase.as_str(), proxy)?
+        }
+        None => StdBackend::open_session_vault(&vault_path, passphrase.as_str())?,
+    };
+    let tor_startup_notice = if backend.tor_proxy_configured() {
+        match backend.verify_tor_route().await {
+            Ok(()) => None,
+            Err(error) => Some(format!(
+                "Tor verification failed; network requests are blocked: {error}"
+            )),
+        }
+    } else {
+        None
+    };
 
     let (_session, mut terminal) = TerminalSession::enter()?;
     let mut state = AppState::default();
     let mut selected_link = 0usize;
     let mut show_help = false;
     let mut bookmark_focus = false;
-    let mut notice = None;
+    let mut notice = tor_startup_notice;
     let mut active_form = None;
     let mut image_viewer: Option<ImageViewer> = None;
     let mut next_form_index = 0usize;
+    let mut active_searches = 0usize;
     let (search_tx, mut search_rx) = mpsc::unbounded_channel::<SearchCompletion>();
 
     loop {
         while let Ok(completion) = search_rx.try_recv() {
+            active_searches = active_searches.saturating_sub(1);
             if matches!(
                 &state.view,
                 AppView::SearchResults { query, .. } if query == &completion.query
@@ -181,18 +219,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let metrics = backend.metrics()?;
         terminal.draw(|frame| {
-            render(
-                frame,
-                &state,
-                &metrics,
+            let context = UiContext {
                 selected_link,
                 show_help,
-                notice.as_deref(),
-                active_form
+                notice: notice.as_deref(),
+                modal: active_form
                     .as_ref()
                     .map(ActiveModal::Form)
                     .or_else(|| image_viewer.as_ref().map(ActiveModal::Image)),
-            )
+                tor_configured: backend.tor_proxy_configured(),
+                tor_connected: backend.tor_route_connected(),
+            };
+            render(frame, &state, &metrics, context)
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -202,6 +240,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         break;
+                    } else if key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if active_searches > 0 {
+                            notice = Some(
+                                "Wait for the current search to finish before changing Tor mode."
+                                    .to_owned(),
+                            );
+                        } else {
+                            let enable_tor = !backend.tor_proxy_configured();
+                            match backend.save_session() {
+                                Ok(()) => {
+                                    let next_backend = if enable_tor {
+                                        StdBackend::open_session_vault_with_tor_proxy(
+                                            &vault_path,
+                                            passphrase.as_str(),
+                                            &tor_proxy_url,
+                                        )
+                                    } else {
+                                        StdBackend::open_session_vault(
+                                            &vault_path,
+                                            passphrase.as_str(),
+                                        )
+                                    };
+                                    match next_backend {
+                                        Ok((next_backend, _)) => {
+                                            backend = next_backend;
+                                            if enable_tor {
+                                                notice = match backend.verify_tor_route().await {
+                                                    Ok(()) => Some(
+                                                        "Tor connected and verified.".to_owned(),
+                                                    ),
+                                                    Err(error) => Some(format!(
+                                                        "Tor verification failed; network requests are blocked: {error}"
+                                                    )),
+                                                };
+                                            } else {
+                                                notice = Some(
+                                                    "Tor disabled; using direct networking."
+                                                        .to_owned(),
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            notice = Some(format!(
+                                                "Could not change network mode: {error}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    notice = Some(format!("Could not save session: {error}"));
+                                }
+                            }
+                        }
                     } else if key.code == KeyCode::Char('l')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -350,6 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let query = query.clone();
                                         let backend = backend.clone();
                                         let search_tx = search_tx.clone();
+                                        active_searches = active_searches.saturating_add(1);
                                         tokio::spawn(async move {
                                             let result = search_searxng(&backend, &query).await;
                                             let _ =
@@ -700,11 +794,16 @@ fn render(
     frame: &mut ratatui::Frame<'_>,
     state: &AppState,
     metrics: &SystemMetrics,
-    selected_link: usize,
-    show_help: bool,
-    notice: Option<&str>,
-    modal: Option<ActiveModal<'_>>,
+    context: UiContext<'_>,
 ) {
+    let UiContext {
+        selected_link,
+        show_help,
+        notice,
+        modal,
+        tor_configured,
+        tor_connected,
+    } = context;
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -731,7 +830,24 @@ fn render(
             },
             Style::default().fg(Color::Yellow),
         ),
-        Span::raw("  [Tor: DISCONNECTED]"),
+        Span::raw("  [Ctrl+T] Tor: "),
+        Span::styled(
+            if tor_connected {
+                "CONNECTED"
+            } else if tor_configured {
+                "DISCONNECTED"
+            } else {
+                "DIRECT"
+            },
+            Style::default().fg(if tor_connected {
+                Color::Green
+            } else if tor_configured {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::raw("]"),
     ]))
     .block(Block::default().borders(Borders::ALL));
     frame.render_widget(header, areas[0]);
@@ -833,7 +949,7 @@ fn render(
                 || "[f] Fill form".to_owned(),
                 |url| {
                     format!(
-                        "Link {} of {}: {url}  [Tab] Next  [Shift+Tab] Previous  [Enter] Open  [f] Form",
+                        "Link {} of {}: {url}  [Tab] Next  [Shift+Tab] Previous  [Enter] Open  [f] Form  [Ctrl+T] Tor",
                         selected_link + 1,
                         links.len()
                     )
@@ -856,7 +972,7 @@ fn render(
     if !matches!(state.view, AppView::ArticleReader { .. }) {
         frame.render_widget(
             Paragraph::new(
-                "[Ctrl+L] Search  [F1] Help  [Tab] Bookmark/Next Link  [1-9] Select  [PgUp/PgDn] Page  [Esc] Back  [q] Quit",
+                "[Ctrl+L] Search  [Ctrl+T] Tor  [F1] Help  [Tab] Bookmark/Next Link  [1-9] Select  [PgUp/PgDn] Page  [Esc] Back  [q] Quit",
             ),
             areas[2],
         );
@@ -872,7 +988,7 @@ fn render(
         let area = centered_rect(60, 40, frame.size());
         frame.render_widget(
             Paragraph::new(
-                "Keyboard: Ctrl+L returns to search; Tab/Shift+Tab moves between links/fields; i opens images (Left/Right changes images while open); f opens forms; arrows scroll/select; Enter submits; Esc returns; q/Ctrl+C quits.\nMouse: click a result or [LINK N] reference to select it; use the wheel to scroll.",
+                "Keyboard: Ctrl+L returns to search; Ctrl+T toggles Tor using the SOCKS service at NYX_TOR_SOCKS (default 127.0.0.1:9050); Tab/Shift+Tab moves between links/fields; i opens images (Left/Right changes images while open); f opens forms; arrows scroll/select; Enter submits; Esc returns; q/Ctrl+C quits.\nTor: Nyx does not install or start Tor. When enabled, it verifies the SOCKS route and blocks network requests if verification fails; there is no direct fallback.\nMouse: click a result or [LINK N] reference to select it; use the wheel to scroll.",
             )
             .block(Block::default().title("Nyx Help").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),

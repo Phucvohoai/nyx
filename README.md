@@ -8,13 +8,13 @@ Nyx is an experimental, privacy-minded text browser written in Rust. It presents
 
 - Search through a SearXNG JSON API, with a local instance as the default.
 - Navigate directly to HTTP and HTTPS URLs.
-- Convert HTML pages into readable text, links, basic forms, and image references.
+- Extract semantic article content in reading order, with separated link, form, and image references.
 - Submit supported HTML GET/POST forms. Session cookies can be stored in an encrypted local vault.
 - View PNG, JPEG, WebP, and the first frame of GIF images as true-color terminal pixels.
 - Browse using keyboard and mouse controls.
 - Keep core state, HTML parsing, and the platform/network adapter in separate workspace crates.
 
-Nyx does **not** currently connect to Tor, run JavaScript, or provide a Chromium-like browser engine. The `[Tor: DISCONNECTED]` label is an indicator, not an active Tor connection.
+Nyx uses direct networking by default and does not run a Tor daemon itself. It can require an existing Tor-compatible SOCKS5 service; see [Tor routing](#tor-routing). Nyx does not run JavaScript or provide a Chromium-like browser engine.
 
 ## Requirements
 
@@ -70,12 +70,35 @@ cargo run -p nyx-tui
 
 The endpoint must accept `format=json` and `q=<query>` parameters. Nyx reports a clear search error if the service is unreachable or returns invalid JSON.
 
+## Tor routing
+
+Nyx can route HTTP and HTTPS requests through a separate Tor SOCKS5 service. This keeps the Tor client outside the browser and allows Nyx to use the same service on desktop Linux/Windows and, eventually, Axon. Press `Ctrl+T` in Nyx to switch between direct networking and Tor; Nyx does not install or start the Tor service.
+
+1. Install and start a trusted Tor service that exposes a local SOCKS5 port. For example, the Tor Expert Bundle can provide a standalone Tor service on Windows. A Tor daemon commonly uses port `9050`.
+2. In Nyx press `Ctrl+T`. By default Nyx tries `socks5h://127.0.0.1:9050` and verifies the route before enabling network requests. The status shows `CONNECTED` only after successful verification.
+3. If your service uses another SOCKS port or address, set `NYX_TOR_SOCKS` to its `socks5h` endpoint before starting Nyx:
+
+   ```powershell
+   $env:NYX_TOR_SOCKS = "socks5h://127.0.0.1:9150"
+   cargo run -p nyx-tui
+   ```
+
+   When this variable is set Nyx starts in Tor mode and checks `https://check.torproject.org/api/ip` at startup.
+
+When Tor mode is enabled, Nyx fails closed: an unavailable/unverified proxy blocks network requests, and Nyx never silently retries over a direct connection. Press `Ctrl+T` to explicitly return to direct networking. Only `socks5h://` is accepted so destination DNS resolution is handled by the SOCKS service.
+
+Requests to loopback addresses (`localhost`, `127.0.0.1`, and `::1`) bypass the SOCKS proxy so Nyx can reach a local SearXNG instance. That local SearXNG service makes its own upstream requests; configure its outbound networking separately if those requests must also use Tor.
+
+Tor is not a guarantee of anonymity. Signing in to personal accounts can identify you; websites can block Tor exits; and this setup does not proxy traffic from other applications or protect against endpoint compromise.
+Nyx's Tor mode uses a Firefox-like User-Agent and omits Chromium client hints, but its HTTP/TLS behavior is not Tor Browser's and can still be distinguishable. Do not treat Nyx as equivalent to Tor Browser for high-risk anonymity.
+
 ## Keyboard controls
 
 | Key | Action |
 | --- | --- |
 | `Enter` | Submit a search or open the selected link |
 | `Ctrl+L` | Return to the search/home screen |
+| `Ctrl+T` | Toggle direct/Tor networking; requires a running SOCKS5 Tor service |
 | `Tab` / `Shift+Tab` | Cycle through links or form fields |
 | `1`–`9` | Select a visible result or article link |
 | `PageUp` / `PageDown` | Change result pages or scroll |

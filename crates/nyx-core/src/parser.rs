@@ -76,6 +76,8 @@ impl HtmlParser {
         let link_selector = selector("a[href]")?;
         let image_selector = selector("img[src], img[data-src]")?;
         let form_selector = selector("form")?;
+        let body_selector = selector("body")?;
+        let root_selector = selector("main, article, [role=main]")?;
 
         let title = document
             .select(&title_selector)
@@ -84,26 +86,42 @@ impl HtmlParser {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "Untitled article".to_owned());
 
+        let root = document
+            .select(&root_selector)
+            .next()
+            .or_else(|| document.select(&body_selector).next());
         let mut blocks = Vec::new();
-        for element in document.select(&block_selector) {
-            let parts = clean_text(element);
-            let text = normalize_text(parts.iter().map(String::as_str));
-            if !text.is_empty() && blocks.last() != Some(&text) {
-                blocks.push(text);
+        if let Some(root) = root {
+            for element in root.select(&block_selector) {
+                if has_block_ancestor(element) {
+                    continue;
+                }
+                let text = normalize_text(clean_text(element).iter().map(String::as_str));
+                if text.is_empty() || blocks.last() == Some(&text) {
+                    continue;
+                }
+                let tag = element.value().name();
+                let formatted = match tag {
+                    "h1" => format!("# {text}"),
+                    "h2" => format!("## {text}"),
+                    "h3" | "h4" | "h5" | "h6" => format!("### {text}"),
+                    "li" => format!("• {text}"),
+                    "blockquote" => format!("> {text}"),
+                    _ => text,
+                };
+                blocks.push(formatted);
             }
-        }
-        if blocks.is_empty() {
-            if let Some(body) = document.select(&selector("body")?).next() {
-                let parts = clean_text(body);
-                let text = normalize_text(parts.iter().map(String::as_str));
+            if blocks.is_empty() {
+                let text = normalize_text(clean_text(root).iter().map(String::as_str));
                 if !text.is_empty() {
                     blocks.push(text);
                 }
             }
         }
 
-        let links: Vec<String> = document
-            .select(&link_selector)
+        let links: Vec<String> = root
+            .into_iter()
+            .flat_map(|root| root.select(&link_selector))
             .filter(|anchor| !is_in_excluded_context(*anchor))
             .filter_map(|anchor| anchor.value().attr("href"))
             .map(str::trim)
@@ -117,8 +135,9 @@ impl HtmlParser {
             .map(|url| url.into())
             .collect();
 
-        let images = document
-            .select(&image_selector)
+        let images = root
+            .into_iter()
+            .flat_map(|root| root.select(&image_selector))
             .filter(|image| !is_in_excluded_context(*image))
             .filter_map(|image| {
                 let source = image
@@ -141,8 +160,9 @@ impl HtmlParser {
             .take(100)
             .collect::<Vec<_>>();
 
-        let forms: Vec<HtmlForm> = document
-            .select(&form_selector)
+        let forms: Vec<HtmlForm> = root
+            .into_iter()
+            .flat_map(|root| root.select(&form_selector))
             .filter_map(|form| parse_form(form, &page_url))
             .collect();
 
@@ -157,6 +177,7 @@ impl HtmlParser {
             if !content.is_empty() {
                 content.push_str("\n\n");
             }
+            content.push_str("Forms\n-----\n");
             content.push_str(&references);
         }
         if !images.is_empty() {
@@ -176,6 +197,7 @@ impl HtmlParser {
             if !content.is_empty() {
                 content.push_str("\n\n");
             }
+            content.push_str("Images\n------\n");
             content.push_str(&references);
         }
         if !links.is_empty() {
@@ -188,6 +210,7 @@ impl HtmlParser {
             if !content.is_empty() {
                 content.push_str("\n\n");
             }
+            content.push_str("Links\n-----\n");
             content.push_str(&references);
         }
 
@@ -199,6 +222,28 @@ impl HtmlParser {
             forms,
         })
     }
+}
+
+fn has_block_ancestor(element: ElementRef<'_>) -> bool {
+    element
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .any(|ancestor| {
+            matches!(
+                ancestor.value().name(),
+                "h1" | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "p"
+                    | "li"
+                    | "blockquote"
+                    | "pre"
+                    | "td"
+                    | "th"
+            )
+        })
 }
 
 fn selector(value: &str) -> Result<Selector, ParserError> {
@@ -406,10 +451,22 @@ fn parse_form(element: ElementRef<'_>, page_url: &Url) -> Option<HtmlForm> {
 }
 
 fn normalize_text<'a>(parts: impl Iterator<Item = &'a str>) -> String {
-    parts
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut output = String::new();
+    for word in parts.flat_map(str::split_whitespace) {
+        let starts_with_closing_punctuation = word
+            .chars()
+            .next()
+            .is_some_and(|character| ".,!?;:%)]}»”’".contains(character));
+        let follows_opening_punctuation = output
+            .chars()
+            .last()
+            .is_some_and(|character| "([{«“‘".contains(character));
+        if !output.is_empty() && !starts_with_closing_punctuation && !follows_opening_punctuation {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output
 }
 
 fn clean_text(element: ElementRef<'_>) -> Vec<String> {
@@ -484,6 +541,33 @@ mod tests {
         assert!(!article.content.contains("Navigation noise"));
         assert!(!article.content.contains("Hidden text"));
         assert_eq!(article.links, ["https://example.test/page"]);
+    }
+
+    #[test]
+    fn keeps_article_blocks_in_reading_order_without_nested_duplicates() {
+        let article = match HtmlParser::parse_article_at(
+            r#"
+                <html><body>
+                  <nav><a href="/menu">Navigation</a></nav>
+                  <main>
+                    <h1>Chapter title</h1>
+                    <p>First paragraph with <a href="/one">a link</a>.</p>
+                    <ul><li>First item</li><li>Second item</li></ul>
+                    <section><p>Last paragraph.</p></section>
+                  </main>
+                </body></html>
+            "#,
+            "https://comics.example/chapter",
+        ) {
+            Ok(article) => article,
+            Err(error) => panic!("semantic article parsing failed: {error}"),
+        };
+
+        assert_eq!(
+            article.content,
+            "# Chapter title\n\nFirst paragraph with a link.\n\n• First item\n\n• Second item\n\nLast paragraph.\n\nLinks\n-----\n[LINK 1] https://comics.example/one"
+        );
+        assert!(!article.content.contains("Navigation"));
     }
 
     #[test]

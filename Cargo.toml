@@ -8,7 +8,6 @@ resolver = "2"
 
 [workspace.dependencies]
 argon2 = "0.5"
-arti-client = "0.14"
 chacha20poly1305 = "0.10"
 cookie_store = "0.22"
 crossterm = "0.27"
@@ -17,7 +16,7 @@ httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 ratatui = "0.26"
-reqwest = { version = "0.12", default-features = false, features = ["cookies", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "rustls-tls", "socks"] }
 rpassword = "7"
 scraper = "0.18"
 serde_json = "1"
