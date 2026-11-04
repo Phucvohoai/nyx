@@ -107,10 +107,16 @@ impl HtmlParser {
     }
 
     pub fn parse_article_at(html: &str, page_url: &str) -> Result<Article, ParserError> {
-        if html.starts_with("%PDF-") || html.chars().take(100).any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t') {
+        if html.starts_with("%PDF-")
+            || html
+                .chars()
+                .take(100)
+                .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+        {
             return Ok(Article {
                 title: "Binary / Non-HTML Resource".to_owned(),
-                content: "[INFO] Cannot render binary, PDF, or non-text stream directly.".to_owned(),
+                content: "[INFO] Cannot render binary, PDF, or non-text stream directly."
+                    .to_owned(),
                 links: vec![],
                 images: vec![],
                 forms: vec![],
