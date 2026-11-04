@@ -113,12 +113,20 @@ impl Drop for FormSubmission {
 pub struct PageResponse {
     pub url: Url,
     pub body: String,
+    pub warning: Option<String>,
 }
 
 pub trait NetworkAdapter: Send + Sync {
     fn fetch<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, String>;
     fn fetch_bytes<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, Vec<u8>> {
         Box::pin(async move { self.fetch(url).await.map(String::into_bytes) })
+    }
+    fn fetch_bytes_with_referer<'a>(
+        &'a self,
+        url: &'a str,
+        _referer: &'a str,
+    ) -> AdapterFuture<'a, Vec<u8>> {
+        self.fetch_bytes(url)
     }
     fn fetch_page<'a>(&'a self, url: &'a str) -> AdapterFuture<'a, PageResponse>;
     fn submit_form<'a>(&'a self, submission: &'a FormSubmission)
@@ -194,26 +202,26 @@ impl SearchRateLimiter {
 #[derive(Debug)]
 struct NyxCookieJar {
     store: RwLock<CookieStore>,
-    last_error: Mutex<Option<String>>,
+    last_warning: Mutex<Option<String>>,
 }
 
 impl NyxCookieJar {
     fn new(store: CookieStore) -> Self {
         Self {
             store: RwLock::new(store),
-            last_error: Mutex::new(None),
+            last_warning: Mutex::new(None),
         }
     }
 
-    fn record_error(&self, message: String) {
-        if let Ok(mut last_error) = self.last_error.lock() {
-            *last_error = Some(message);
+    fn record_warning(&self, message: String) {
+        if let Ok(mut last_warning) = self.last_warning.lock() {
+            *last_warning = Some(message);
         }
     }
 
-    fn take_error(&self) -> Option<String> {
-        match self.last_error.lock() {
-            Ok(mut last_error) => last_error.take(),
+    fn take_warning(&self) -> Option<String> {
+        match self.last_warning.lock() {
+            Ok(mut last_warning) => last_warning.take(),
             Err(poisoned) => poisoned.into_inner().take(),
         }
     }
@@ -224,7 +232,7 @@ impl ReqwestCookieStore for NyxCookieJar {
         let mut store = match self.store.write() {
             Ok(store) => store,
             Err(poisoned) => {
-                self.record_error("cookie store lock was poisoned".to_owned());
+                self.record_warning("cookie store lock was poisoned".to_owned());
                 poisoned.into_inner()
             }
         };
@@ -232,11 +240,15 @@ impl ReqwestCookieStore for NyxCookieJar {
             match header.to_str() {
                 Ok(cookie) => {
                     if store.parse(cookie, url).is_err() {
-                        self.record_error("server sent a malformed Set-Cookie header".to_owned());
+                        self.record_warning(
+                            "ignored a malformed Set-Cookie header from the server".to_owned(),
+                        );
                     }
                 }
                 Err(_) => {
-                    self.record_error("server sent a non-text Set-Cookie header".to_owned());
+                    self.record_warning(
+                        "ignored a non-text Set-Cookie header from the server".to_owned(),
+                    );
                 }
             }
         }
@@ -246,7 +258,7 @@ impl ReqwestCookieStore for NyxCookieJar {
         let store = match self.store.read() {
             Ok(store) => store,
             Err(poisoned) => {
-                self.record_error("cookie store lock was poisoned".to_owned());
+                self.record_warning("cookie store lock was poisoned".to_owned());
                 poisoned.into_inner()
             }
         };
@@ -529,6 +541,22 @@ impl NetworkAdapter for StdBackend {
         })
     }
 
+    fn fetch_bytes_with_referer<'a>(
+        &'a self,
+        url: &'a str,
+        referer: &'a str,
+    ) -> AdapterFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            self.ensure_tor_route_verified()?;
+            self.send_bytes_request(
+                self.client
+                    .get(url)
+                    .header(reqwest::header::REFERER, referer),
+            )
+            .await
+        })
+    }
+
     fn submit_form<'a>(
         &'a self,
         submission: &'a FormSubmission,
@@ -627,9 +655,7 @@ impl StdBackend {
         } else {
             None
         };
-        if let Some(error) = self.cookie_jar.take_error() {
-            return Err(AdapterError::CookieStore(error));
-        }
+        let _ = self.cookie_jar.take_warning();
         if let Some(retry_after) = rate_limit_cooldown {
             return Err(AdapterError::RateLimited { retry_after });
         }
@@ -675,9 +701,7 @@ impl StdBackend {
         } else {
             None
         };
-        if let Some(error) = self.cookie_jar.take_error() {
-            return Err(AdapterError::CookieStore(error));
-        }
+        let warning = self.cookie_jar.take_warning();
         if let Some(retry_after) = rate_limit_cooldown {
             return Err(AdapterError::RateLimited { retry_after });
         }
@@ -687,6 +711,7 @@ impl StdBackend {
         Ok(PageResponse {
             url,
             body: body_result?,
+            warning,
         })
     }
 
@@ -1102,13 +1127,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_binary_image_bytes_without_text_conversion(
+    async fn malformed_response_cookies_warn_without_failing_page_navigation(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let _ = read_request(&mut stream).await?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nSet-Cookie: invalid-cookie\r\nSet-Cookie: sid=valid; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .await?;
+            Ok::<_, std::io::Error>(())
+        });
+
+        let backend = StdBackend::new()?;
+        let page = backend.fetch_page(&format!("http://{address}/")).await?;
+        server.await??;
+
+        assert_eq!(page.body, "ok");
+        assert_eq!(
+            page.warning.as_deref(),
+            Some("ignored a malformed Set-Cookie header from the server")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetches_binary_image_bytes_without_text_conversion(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_request(&mut stream).await?;
+            assert!(String::from_utf8_lossy(&request)
+                .to_ascii_lowercase()
+                .contains("referer: https://comics.example/chapter/1"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x00\xff\x80\x01")
                 .await?;
@@ -1117,7 +1173,10 @@ mod tests {
 
         let backend = StdBackend::new()?;
         let bytes = backend
-            .fetch_bytes(&format!("http://{address}/image.png"))
+            .fetch_bytes_with_referer(
+                &format!("http://{address}/image.png"),
+                "https://comics.example/chapter/1",
+            )
             .await?;
         server.await??;
 

@@ -2,8 +2,8 @@ use std::{io, time::Duration};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -11,8 +11,8 @@ use crossterm::{
 use image::{ImageReader, RgbaImage};
 use nyx_core::{
     default_searxng_endpoint, normalize_direct_url, parse_searxng_results, searxng_search_url,
-    AppState, AppView, ArticleImage, FormFieldKind, FormMethod, HtmlForm, HtmlParser, SearchResult,
-    RESULTS_PER_PAGE,
+    AppState, AppView, Article, ArticleImage, FormFieldKind, FormMethod, HtmlForm, HtmlParser,
+    SearchResult, RESULTS_PER_PAGE,
 };
 use nyx_pal::{
     FormRequestMethod, FormSubmission, NetworkAdapter, StdBackend, SystemAdapter, SystemMetrics,
@@ -27,6 +27,7 @@ use ratatui::{
 };
 use std::io::Cursor;
 use tokio::sync::mpsc;
+use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 const DEFAULT_TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
@@ -34,6 +35,15 @@ const DEFAULT_TOR_PROXY: &str = "socks5h://127.0.0.1:9050";
 struct SearchCompletion {
     query: String,
     result: Result<Vec<SearchResult>, String>,
+}
+
+struct PageCompletion {
+    navigation_id: u64,
+    result: Result<(Article, Option<String>), String>,
+}
+
+fn is_current_navigation(completion_id: u64, current_id: u64) -> bool {
+    completion_id == current_id
 }
 
 struct ImageViewer {
@@ -117,7 +127,12 @@ impl TerminalSession {
     fn enter() -> io::Result<(Self, Tui)> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(error);
         }
@@ -126,7 +141,12 @@ impl TerminalSession {
             Ok(terminal) => Ok((Self, terminal)),
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+                let _ = execute!(
+                    stdout,
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
                 let _ = disable_raw_mode();
                 Err(error)
             }
@@ -137,7 +157,12 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -198,7 +223,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut image_viewer: Option<ImageViewer> = None;
     let mut next_form_index = 0usize;
     let mut active_searches = 0usize;
+    let mut active_navigation = false;
+    let mut navigation_id = 0u64;
+    let mut active_navigation_task: Option<tokio::task::JoinHandle<()>> = None;
     let (search_tx, mut search_rx) = mpsc::unbounded_channel::<SearchCompletion>();
+    let (page_tx, mut page_rx) = mpsc::unbounded_channel::<PageCompletion>();
 
     loop {
         while let Ok(completion) = search_rx.try_recv() {
@@ -214,6 +243,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(error) => notice = Some(format!("Search failed: {error}")),
                 }
+            }
+        }
+        while let Ok(completion) = page_rx.try_recv() {
+            if !is_current_navigation(completion.navigation_id, navigation_id) {
+                continue;
+            }
+            active_navigation = false;
+            active_navigation_task = None;
+            match completion.result {
+                Ok((article, warning)) => {
+                    state.open_article(
+                        article.title,
+                        article.content,
+                        article.links,
+                        article.images,
+                        article.forms,
+                    );
+                    state.input.clear();
+                    state.bookmark_input.clear();
+                    selected_link = 0;
+                    notice = warning.or_else(|| Some("Page loaded.".to_owned()));
+                }
+                Err(error) => notice = Some(format!("Page failed: {error}")),
             }
         }
 
@@ -240,6 +292,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         break;
+                    } else if key.code == KeyCode::Char('l')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        navigation_id = navigation_id.wrapping_add(1);
+                        active_navigation = false;
+                        notice = None;
+                        if let Some(task) = active_navigation_task.take() {
+                            task.abort();
+                        }
+                        state.go_home();
+                        selected_link = 0;
+                        bookmark_focus = false;
+                        active_form = None;
+                        image_viewer = None;
+                        continue;
                     } else if key.code == KeyCode::Char('t')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
@@ -295,16 +362,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                    } else if key.code == KeyCode::Char('l')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        state.go_home();
-                        selected_link = 0;
-                        bookmark_focus = false;
-                        notice = None;
-                        active_form = None;
-                        image_viewer = None;
-                        continue;
                     }
                     let code = if key.code == KeyCode::Tab
                         && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -327,8 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         images.len(),
                                         code == KeyCode::Right,
                                     ) {
-                                        match load_article_image(&backend, images, next).await {
-                                            Ok(viewer) => image_viewer = Some(viewer),
+                                        match load_available_article_image(
+                                            &backend,
+                                            images,
+                                            next,
+                                            code == KeyCode::Right,
+                                        )
+                                        .await
+                                        {
+                                            Ok((viewer, skipped)) => {
+                                                image_viewer = Some(viewer);
+                                                notice = skipped_image_notice(skipped);
+                                            }
                                             Err(error) => notice = Some(error),
                                         }
                                     }
@@ -351,6 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let submission = form_session.submission();
                                         match backend.submit_form(&submission).await {
                                             Ok(page) => {
+                                                let cookie_warning = page.warning.clone();
                                                 match HtmlParser::parse_article_at(
                                                     &page.body,
                                                     page.url.as_str(),
@@ -365,7 +433,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         );
                                                         active_form = None;
                                                         selected_link = 0;
-                                                        notice = Some("Form submitted.".to_owned());
+                                                        notice = cookie_warning.or_else(|| {
+                                                            Some("Form submitted.".to_owned())
+                                                        });
                                                     }
                                                     Err(error) => {
                                                         notice = Some(error.to_string());
@@ -397,10 +467,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if images.is_empty() {
                             notice = Some("This page has no supported images.".to_owned());
                         } else {
-                            match load_article_image(&backend, images, 0).await {
-                                Ok(viewer) => {
+                            match load_available_article_image(&backend, images, 0, true).await {
+                                Ok((viewer, skipped)) => {
                                     image_viewer = Some(viewer);
-                                    notice = None;
+                                    notice = skipped_image_notice(skipped);
                                 }
                                 Err(error) => notice = Some(error),
                             }
@@ -439,13 +509,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     state.submit_search();
                                     if let AppView::SearchResults { query, .. } = &state.view {
-                                        notice = Some("Searching local SearXNG...".to_owned());
+                                        let youtube_query =
+                                            youtube_search_query(query).map(str::to_owned);
+                                        notice = Some(if youtube_query.is_some() {
+                                            "Searching YouTube videos...".to_owned()
+                                        } else {
+                                            "Searching local SearXNG...".to_owned()
+                                        });
                                         let query = query.clone();
                                         let backend = backend.clone();
                                         let search_tx = search_tx.clone();
                                         active_searches = active_searches.saturating_add(1);
                                         tokio::spawn(async move {
-                                            let result = search_searxng(&backend, &query).await;
+                                            let result = if let Some(video_query) = youtube_query {
+                                                if backend.tor_proxy_configured() {
+                                                    Err("YouTube search is disabled in Tor mode because yt-dlp cannot currently be routed through Nyx's SOCKS proxy.".to_owned())
+                                                } else {
+                                                    search_youtube_videos(&video_query).await
+                                                }
+                                            } else {
+                                                search_searxng(&backend, &query).await
+                                            };
                                             let _ =
                                                 search_tx.send(SearchCompletion { query, result });
                                         });
@@ -461,8 +545,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         if let Some(url) = target {
-                            notice = open_url(&backend, &mut state, &url).await;
-                            selected_link = 0;
+                            if active_navigation {
+                                notice =
+                                    Some("Wait for the current page load to finish.".to_owned());
+                            } else {
+                                active_navigation = true;
+                                navigation_id = navigation_id.wrapping_add(1);
+                                let current_navigation_id = navigation_id;
+                                notice = Some(format!("Loading {url}"));
+                                let backend = backend.clone();
+                                let page_tx = page_tx.clone();
+                                active_navigation_task = Some(tokio::spawn(async move {
+                                    let result = async {
+                                        let page = backend
+                                            .fetch_page(&url)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        let article = HtmlParser::parse_article_at(
+                                            &page.body,
+                                            page.url.as_str(),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                        Ok((article, page.warning))
+                                    }
+                                    .await;
+                                    let _ = page_tx.send(PageCompletion {
+                                        navigation_id: current_navigation_id,
+                                        result,
+                                    });
+                                }));
+                            }
                         }
                     } else if handle_key(
                         code,
@@ -473,6 +585,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ) {
                         break;
                     }
+                }
+                Event::Paste(pasted) if matches!(state.view, AppView::Home) => {
+                    if bookmark_focus {
+                        append_pasted_text(&mut state.bookmark_input, &pasted);
+                    } else {
+                        append_pasted_text(&mut state.input, &pasted);
+                    }
+                    notice = None;
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
@@ -522,6 +642,53 @@ fn link_reference_at(content: &str, scroll: u16, visible_row: usize) -> Option<u
     let reference = line.strip_prefix("[LINK ")?;
     let (number, _) = reference.split_once(']')?;
     number.parse::<usize>().ok()?.checked_sub(1)
+}
+
+fn is_youtube_video_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let path_segments = url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if host.eq_ignore_ascii_case("youtu.be") {
+        return !path_segments.is_empty();
+    }
+    if !(host.eq_ignore_ascii_case("youtube.com")
+        || host
+            .to_ascii_lowercase()
+            .strip_suffix("youtube.com")
+            .is_some_and(|prefix| prefix.ends_with('.')))
+    {
+        return false;
+    }
+
+    if url.path() == "/watch" {
+        return url
+            .query_pairs()
+            .any(|(key, value)| key == "v" && !value.is_empty());
+    }
+    matches!(
+        path_segments.as_slice(),
+        [kind, id, ..] if matches!(*kind, "shorts" | "embed" | "live") && !id.is_empty()
+    )
+}
+
+fn append_pasted_text(input: &mut String, pasted: &str) {
+    input.extend(pasted.chars().filter(|character| !character.is_control()));
 }
 
 fn next_form_field(session: &FormSession, forward: bool) -> Option<usize> {
@@ -609,28 +776,6 @@ fn validate_form(session: &FormSession) -> Result<(), String> {
     Ok(())
 }
 
-async fn open_url(backend: &StdBackend, state: &mut AppState, url: &str) -> Option<String> {
-    let page = match backend.fetch_page(url).await {
-        Ok(page) => page,
-        Err(error) => return Some(error.to_string()),
-    };
-    match HtmlParser::parse_article_at(&page.body, page.url.as_str()) {
-        Ok(article) => {
-            state.open_article(
-                article.title,
-                article.content,
-                article.links,
-                article.images,
-                article.forms,
-            );
-            state.input.clear();
-            state.bookmark_input.clear();
-            None
-        }
-        Err(error) => Some(error.to_string()),
-    }
-}
-
 async fn load_article_image(
     backend: &dyn NetworkAdapter,
     images: &[ArticleImage],
@@ -643,30 +788,147 @@ async fn load_article_image(
         .get(index)
         .ok_or_else(|| "Image selection is out of range.".to_owned())?;
     let bytes = backend
-        .fetch_bytes(&image.url)
+        .fetch_bytes_with_referer(&image.url, &image.referer)
         .await
         .map_err(|error| format!("Image download failed: {error}"))?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err("Image download exceeded the 20 MiB limit.".to_owned());
     }
-    let reader = ImageReader::new(Cursor::new(&bytes))
+    let image = decode_image(&image.url, &bytes, MAX_IMAGE_PIXELS)?;
+    Ok(ImageViewer { index, image })
+}
+
+async fn load_available_article_image(
+    backend: &dyn NetworkAdapter,
+    images: &[ArticleImage],
+    start_index: usize,
+    forward: bool,
+) -> Result<(ImageViewer, usize), String> {
+    let indices = image_indices(start_index, images.len(), forward);
+    if indices.is_empty() {
+        return Err("This page has no supported images.".to_owned());
+    }
+
+    let mut last_error = String::new();
+    for (skipped, index) in indices.into_iter().enumerate() {
+        match load_article_image(backend, images, index).await {
+            Ok(viewer) => return Ok((viewer, skipped)),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(format!(
+        "No readable images found among {} image(s). Last error: {last_error}",
+        images.len()
+    ))
+}
+
+fn image_indices(start_index: usize, image_count: usize, forward: bool) -> Vec<usize> {
+    if image_count == 0 || start_index >= image_count {
+        return Vec::new();
+    }
+    (0..image_count)
+        .map(|offset| {
+            if forward {
+                (start_index + offset) % image_count
+            } else {
+                (start_index + image_count - (offset % image_count)) % image_count
+            }
+        })
+        .collect()
+}
+
+fn skipped_image_notice(skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!("Skipped {skipped} unavailable image(s); showing the next readable panel.")
+    })
+}
+
+fn decode_image(url: &str, bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, String> {
+    if looks_like_svg(bytes) {
+        return decode_svg(bytes, max_pixels);
+    }
+    if !has_supported_image_signature(bytes) {
+        return Err(unrecognized_image_response(url, bytes));
+    }
+
+    let reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|error| format!("Could not identify image format: {error}"))?;
+        .map_err(|error| format!("Could not inspect image data: {error}"))?;
+    if reader.format().is_none() {
+        return Err(unrecognized_image_response(url, bytes));
+    }
+
     let (width, height) = reader
         .into_dimensions()
         .map_err(|error| format!("Could not read image dimensions: {error}"))?;
-    if u64::from(width).saturating_mul(u64::from(height)) > MAX_IMAGE_PIXELS {
-        return Err("Image is too large to display safely.".to_owned());
-    }
     if width == 0 || height == 0 {
         return Err("Image has invalid dimensions.".to_owned());
     }
-    let image = image::load_from_memory(&bytes)
-        .map_err(|error| format!("Could not decode image: {error}"))?;
-    Ok(ImageViewer {
-        index,
-        image: image.to_rgba8(),
-    })
+    if u64::from(width).saturating_mul(u64::from(height)) > max_pixels {
+        return Err("Image is too large to display safely.".to_owned());
+    }
+    image::load_from_memory(bytes)
+        .map(|image| image.to_rgba8())
+        .map_err(|error| format!("Could not decode image: {error}"))
+}
+
+fn has_supported_image_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xff\xd8\xff")
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
+        || (bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avif")
+        || (bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && &bytes[8..12] == b"avis")
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let prefix = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+    prefix.contains("<svg") || prefix.contains("<?xml") && prefix.contains("<svg")
+}
+
+fn decode_svg(bytes: &[u8], max_pixels: u64) -> Result<RgbaImage, String> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())
+        .map_err(|error| format!("Could not parse SVG image: {error}"))?;
+    let size = tree.size();
+    let width = size.width().ceil() as u32;
+    let height = size.height().ceil() as u32;
+    if width == 0 || height == 0 {
+        return Err("SVG image has invalid dimensions.".to_owned());
+    }
+    if u64::from(width).saturating_mul(u64::from(height)) > max_pixels {
+        return Err("SVG image is too large to display safely.".to_owned());
+    }
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| "Could not allocate SVG image pixels.".to_owned())?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
+    RgbaImage::from_raw(width, height, pixmap.take())
+        .ok_or_else(|| "Could not convert SVG pixels.".to_owned())
+}
+
+fn unrecognized_image_response(url: &str, bytes: &[u8]) -> String {
+    let body = String::from_utf8_lossy(&bytes[..bytes.len().min(512)])
+        .trim_start()
+        .to_ascii_lowercase();
+    let location = Url::parse(url)
+        .ok()
+        .map(|url| format!("{}{}", url.host_str().unwrap_or("image host"), url.path()))
+        .unwrap_or_else(|| "unknown image URL".to_owned());
+    if body.starts_with("<!doctype html")
+        || body.starts_with("<html")
+        || body.starts_with("<?xml")
+        || body.starts_with("{")
+    {
+        format!(
+            "The server returned a web/error document instead of a supported image ({location})."
+        )
+    } else {
+        format!("Unsupported or unknown image format ({location}); supported: PNG, JPEG, GIF, WebP, SVG.")
+    }
 }
 
 async fn search_searxng(
@@ -689,6 +951,109 @@ async fn search_searxng(
     parse_searxng_results(&html).map_err(|error| {
         format!("SearXNG returned an invalid response (is JSON output enabled?): {error}")
     })
+}
+
+fn youtube_search_query(query: &str) -> Option<&str> {
+    let (prefix, search) = query.trim().split_at_checked(3)?;
+    if prefix.eq_ignore_ascii_case("yt:") {
+        let search = search.trim();
+        (!search.is_empty()).then_some(search)
+    } else {
+        None
+    }
+}
+
+async fn search_youtube_videos(query: &str) -> Result<Vec<SearchResult>, String> {
+    if query.trim().is_empty() {
+        return Err("Enter a YouTube search term after `yt:`.".to_owned());
+    }
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("yt-dlp")
+            .args([
+                "--flat-playlist",
+                "--dump-single-json",
+                "--no-warnings",
+                "--socket-timeout",
+                "15",
+                "--playlist-end",
+                "10",
+            ])
+            .arg(format!("ytsearch10:{query}"))
+            .output(),
+    )
+    .await
+    .map_err(|_| "YouTube search timed out after 30 seconds.".to_owned())?
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            "yt-dlp is not installed or is not on PATH; install it to search YouTube videos."
+                .to_owned()
+        } else {
+            format!("Could not start yt-dlp: {error}")
+        }
+    })?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        let details = details.trim();
+        return Err(if details.is_empty() {
+            format!("yt-dlp exited with status {}.", output.status)
+        } else {
+            format!("YouTube search failed: {details}")
+        });
+    }
+
+    parse_youtube_search_results(&output.stdout)
+}
+
+fn parse_youtube_search_results(json: &[u8]) -> Result<Vec<SearchResult>, String> {
+    let response: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|error| format!("yt-dlp returned invalid search data: {error}"))?;
+    let entries = response
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "yt-dlp returned no video results.".to_owned())?;
+
+    let results = entries
+        .iter()
+        .filter_map(|entry| {
+            let title = entry.get("title")?.as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let url = entry
+                .get("webpage_url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| is_youtube_video_url(url))
+                .map(str::to_owned)
+                .or_else(|| {
+                    let id = entry.get("id")?.as_str()?;
+                    if id.is_empty()
+                        || !id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                    {
+                        return None;
+                    }
+                    Some(format!("https://www.youtube.com/watch?v={id}"))
+                })?;
+            let snippet = entry
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("YouTube video")
+                .to_owned();
+            Some(SearchResult {
+                title: title.to_owned(),
+                url,
+                snippet,
+            })
+        })
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        Err("No YouTube videos were found for that query.".to_owned())
+    } else {
+        Ok(results)
+    }
 }
 
 fn handle_key(
@@ -755,7 +1120,7 @@ fn handle_key(
         }
         KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
         KeyCode::Down => state.scroll = state.scroll.saturating_add(1),
-        KeyCode::Char(character @ '1'..='9') => {
+        KeyCode::Char(character @ '1'..='9') if !matches!(state.view, AppView::Home) => {
             let index = usize::from(character as u8 - b'1');
             if let AppView::SearchResults { links, .. } = &state.view {
                 let absolute_index = state
@@ -809,10 +1174,14 @@ fn render(
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(1),
         ])
         .split(frame.size());
+    let control_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(areas[2]);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -863,6 +1232,7 @@ fn render(
                 )),
                 Line::from(""),
                 Line::from("Enter a search or URL in the header input and press Enter."),
+                Line::from("Search YouTube videos with: yt: your search terms"),
                 Line::from(""),
                 Line::from("Quick bookmarks: enter a URL below and press Enter to open it."),
                 Line::from(format!(
@@ -955,7 +1325,7 @@ fn render(
                     )
                 },
             );
-            let focused_link = format!("{focused_link}  [i] View image ({})", images.len());
+            let focused_link = format!("{focused_link}  [i] Read images ({})", images.len());
             let article = Paragraph::new(lines)
                 .block(
                     Block::default()
@@ -965,30 +1335,57 @@ fn render(
                 .wrap(Wrap { trim: true })
                 .scroll((state.scroll, 0));
             frame.render_widget(article, areas[1]);
-            frame.render_widget(Paragraph::new(focused_link), areas[2]);
+            frame.render_widget(Paragraph::new(focused_link), control_areas[0]);
         }
     }
 
-    if !matches!(state.view, AppView::ArticleReader { .. }) {
+    if matches!(modal.as_ref(), Some(ActiveModal::Image(_))) {
         frame.render_widget(
-            Paragraph::new(
-                "[Ctrl+L] Search  [Ctrl+T] Tor  [F1] Help  [Tab] Bookmark/Next Link  [1-9] Select  [PgUp/PgDn] Page  [Esc] Back  [q] Quit",
-            ),
-            areas[2],
+            Paragraph::new("[Left/Right] Previous/next readable panel  [Esc] Close reader"),
+            control_areas[0],
         );
+    } else if !matches!(state.view, AppView::ArticleReader { .. }) {
+        let controls = if matches!(state.view, AppView::Home) {
+            "[Enter] Search/open  [Tab] Bookmark input  [Ctrl+V] Paste  [Ctrl+T] Tor  [F1] Help  [q] Quit"
+        } else {
+            "[↑/↓] Select  [Enter] Open  [PgUp/PgDn] Page/scroll  [Tab] Next link  [i] Images  [F1] Help  [q] Quit"
+        };
+        frame.render_widget(Paragraph::new(controls), control_areas[0]);
     }
-    let status = format_metrics(Some(metrics));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("[OK]", Style::default().fg(Color::Green)),
+            Span::raw(" Success  "),
+            Span::styled("[WAIT/WARN]", Style::default().fg(Color::Yellow)),
+            Span::raw(" Loading / warning  "),
+            Span::styled("[ERROR]", Style::default().fg(Color::Red)),
+            Span::raw(" Failure"),
+        ])),
+        control_areas[1],
+    );
+    let metrics_status = format_metrics(Some(metrics));
     let status = if let Some(message) = notice {
-        format!("{message}  |  {status}")
+        let (label, color) = status_indicator(message);
+        Line::from(vec![
+            Span::styled(
+                format!("{label} {message}"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  |  "),
+            Span::styled(metrics_status, Style::default().fg(Color::DarkGray)),
+        ])
     } else {
-        status
+        Line::from(Span::styled(
+            metrics_status,
+            Style::default().fg(Color::DarkGray),
+        ))
     };
     frame.render_widget(Paragraph::new(status), areas[3]);
     if show_help {
         let area = centered_rect(60, 40, frame.size());
         frame.render_widget(
             Paragraph::new(
-                "Keyboard: Ctrl+L returns to search; Ctrl+T toggles Tor using the SOCKS service at NYX_TOR_SOCKS (default 127.0.0.1:9050); Tab/Shift+Tab moves between links/fields; i opens images (Left/Right changes images while open); f opens forms; arrows scroll/select; Enter submits; Esc returns; q/Ctrl+C quits.\nTor: Nyx does not install or start Tor. When enabled, it verifies the SOCKS route and blocks network requests if verification fails; there is no direct fallback.\nMouse: click a result or [LINK N] reference to select it; use the wheel to scroll.",
+                "Keyboard: Enter searches or opens the selected link. Ctrl+V pastes on Home; Ctrl+L returns Home; Ctrl+T toggles Tor. Up/Down selects results or scrolls; PgUp/PgDn changes pages or scrolls. Tab/Shift+Tab cycles links and form fields; 1-9 selects a result/link. Press i to view article images (Left/Right changes image, Esc closes), f to fill a form, F1 for help, and q/Ctrl+C to quit.\nStatus colors: green [OK] means success; yellow [WAIT/WARN] means loading or warning; red [ERROR] means failure.\nYouTube text search uses \"yt: words\"; video playback is not supported. Tor must already be running; Nyx blocks network requests if its configured Tor route is unavailable.\nMouse: click a result or [LINK N] reference to select it; use the wheel to scroll.",
             )
             .block(Block::default().title("Nyx Help").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
@@ -1000,7 +1397,7 @@ fn render(
         Some(ActiveModal::Image(viewer)) => {
             if let AppView::ArticleReader { images, .. } = &state.view {
                 if let Some(image) = images.get(viewer.index) {
-                    render_image_viewer(frame, viewer, image, images.len());
+                    render_image_viewer(frame, viewer, image, images.len(), areas[1]);
                 }
             }
         }
@@ -1008,13 +1405,53 @@ fn render(
     }
 }
 
+fn status_indicator(message: &str) -> (String, Color) {
+    if message.starts_with("Loading ") || message.starts_with("Searching ") {
+        let frames = ['|', '/', '-', '\\'];
+        let frame = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| (time.as_millis() / 120) as usize % frames.len());
+        return (format!("[{}]", frames[frame]), Color::Yellow);
+    }
+
+    let lowercase = message.to_ascii_lowercase();
+    if [
+        "failed",
+        "error",
+        "invalid",
+        "could not",
+        "blocked",
+        "refusing",
+        "too large",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return ("[ERROR]".to_owned(), Color::Red);
+    }
+    if message == "Page loaded."
+        || message == "Form submitted."
+        || message == "Tor connected and verified."
+    {
+        return ("[OK]".to_owned(), Color::Green);
+    }
+    if lowercase.contains("ignored a malformed")
+        || lowercase.contains("ignored a non-text")
+        || lowercase.contains("skipped")
+        || lowercase.contains("warning")
+    {
+        return ("[WARN]".to_owned(), Color::Yellow);
+    }
+    ("[INFO]".to_owned(), Color::Cyan)
+}
+
 fn render_image_viewer(
     frame: &mut ratatui::Frame<'_>,
     viewer: &ImageViewer,
     reference: &ArticleImage,
     image_count: usize,
+    area: ratatui::layout::Rect,
 ) {
-    let area = centered_rect(90, 85, frame.size());
     let title = if reference.alt.is_empty() {
         format!(
             "Image {} of {} — {} — Left/Right: change, Esc: close",
@@ -1032,67 +1469,79 @@ fn render_image_viewer(
     };
     let block = Block::default()
         .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(Color::Cyan))
         .style(Style::default().fg(Color::White).bg(Color::Black));
     frame.render_widget(Clear, area);
-    frame.render_widget(block.clone(), area);
-    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let image_area = ratatui::layout::Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    render_image_pixels(frame, &viewer.image, image_area);
+}
+
+fn render_image_pixels(
+    frame: &mut ratatui::Frame<'_>,
+    image: &RgbaImage,
+    inner: ratatui::layout::Rect,
+) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    let source_width = f64::from(viewer.image.width());
-    let source_height = f64::from(viewer.image.height());
-    let scale =
-        (f64::from(inner.width) / source_width).min(f64::from(inner.height) / source_height);
+    let source_width = f64::from(image.width());
+    let source_height = f64::from(image.height());
+    let available_pixel_width = u32::from(inner.width).saturating_mul(2);
+    let available_pixel_height = u32::from(inner.height).saturating_mul(4);
+    let scale = (f64::from(available_pixel_width) / source_width)
+        .min(f64::from(available_pixel_height) / source_height);
     if !scale.is_finite() || scale <= 0.0 {
         return;
     }
     let target_width = (source_width * scale)
         .floor()
         .max(1.0)
-        .min(f64::from(inner.width)) as u32;
-    let target_height = (source_height * scale * 2.0)
+        .min(f64::from(available_pixel_width)) as u32;
+    let target_height = (source_height * scale)
         .floor()
         .max(1.0)
-        .min(f64::from(inner.height.saturating_mul(2))) as u32;
+        .min(f64::from(available_pixel_height)) as u32;
     let resized = image::imageops::resize(
-        &viewer.image,
+        image,
         target_width,
         target_height,
         image::imageops::FilterType::Lanczos3,
     );
-    let offset_x = (inner.width - target_width as u16) / 2;
-    let offset_y = (inner.height.saturating_mul(2) - target_height as u16) / 2;
+    let offset_x = (available_pixel_width - target_width) / 2;
+    let offset_y = (available_pixel_height - target_height) / 2;
     let lines = (0..inner.height)
         .map(|row| {
             let spans = (0..inner.width)
                 .map(|column| {
-                    let x = column.saturating_sub(offset_x);
-                    let top_position = row.saturating_mul(2);
-                    let bottom_position = top_position.saturating_add(1);
-                    let top_y = top_position.saturating_sub(offset_y);
-                    let bottom_y = bottom_position.saturating_sub(offset_y);
-                    let top = if column >= offset_x
-                        && x < target_width as u16
-                        && top_position >= offset_y
-                        && top_y < target_height as u16
-                    {
-                        pixel_color(resized.get_pixel(u32::from(x), u32::from(top_y)).0)
-                    } else {
-                        Color::Black
-                    };
-                    let bottom = if column >= offset_x
-                        && x < target_width as u16
-                        && bottom_position >= offset_y
-                        && bottom_y < target_height as u16
-                    {
-                        pixel_color(resized.get_pixel(u32::from(x), u32::from(bottom_y)).0)
-                    } else {
-                        Color::Black
-                    };
-                    Span::styled("▀", Style::default().fg(top).bg(bottom))
+                    let mut pixels = [[0u8; 4]; 8];
+                    for pixel_row in 0..4u32 {
+                        for pixel_column in 0..2u32 {
+                            let cell_index = (pixel_row * 2 + pixel_column) as usize;
+                            let x = u32::from(column) * 2 + pixel_column;
+                            let y = u32::from(row) * 4 + pixel_row;
+                            if x >= offset_x
+                                && y >= offset_y
+                                && x - offset_x < target_width
+                                && y - offset_y < target_height
+                            {
+                                pixels[cell_index] =
+                                    resized.get_pixel(x - offset_x, y - offset_y).0;
+                            }
+                        }
+                    }
+
+                    let (glyph, foreground, background) = braille_cell(pixels);
+                    Span::styled(
+                        glyph.to_string(),
+                        Style::default().fg(foreground).bg(background),
+                    )
                 })
                 .collect::<Vec<_>>();
             Line::from(spans)
@@ -1102,6 +1551,68 @@ fn render_image_viewer(
         Paragraph::new(lines).style(Style::default().bg(Color::Black)),
         inner,
     );
+}
+
+const BRAILLE_DOT_BITS: [u8; 8] = [1, 8, 2, 16, 4, 32, 64, 128];
+
+fn braille_cell(pixels: [[u8; 4]; 8]) -> (char, Color, Color) {
+    let luminance = pixels.map(pixel_luminance);
+    let min = luminance.iter().copied().fold(u8::MAX, u8::min);
+    let max = luminance.iter().copied().fold(u8::MIN, u8::max);
+    let threshold = (u16::from(min) + u16::from(max)) / 2;
+    let mut mask = 0u8;
+    let mut dark_pixels = Vec::new();
+    let mut light_pixels = Vec::new();
+    for index in 0..pixels.len() {
+        if u16::from(luminance[index]) >= threshold {
+            mask |= BRAILLE_DOT_BITS[index];
+            light_pixels.push(pixels[index]);
+        } else {
+            dark_pixels.push(pixels[index]);
+        }
+    }
+    if light_pixels.is_empty() {
+        let background = average_pixel_color(&dark_pixels);
+        return (' ', Color::Black, background);
+    }
+    if dark_pixels.is_empty() {
+        let foreground = average_pixel_color(&light_pixels);
+        return ('█', foreground, foreground);
+    }
+    let glyph = char::from_u32(0x2800 + u32::from(mask)).unwrap_or('\u{2800}');
+    (
+        glyph,
+        average_pixel_color(&light_pixels),
+        average_pixel_color(&dark_pixels),
+    )
+}
+
+fn pixel_luminance(pixel: [u8; 4]) -> u8 {
+    let color = pixel_color(pixel);
+    if let Color::Rgb(red, green, blue) = color {
+        ((u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000) as u8
+    } else {
+        0
+    }
+}
+
+fn average_pixel_color(pixels: &[[u8; 4]]) -> Color {
+    let count = pixels.len() as u32;
+    let mut red = 0u32;
+    let mut green = 0u32;
+    let mut blue = 0u32;
+    for pixel in pixels {
+        if let Color::Rgb(pixel_red, pixel_green, pixel_blue) = pixel_color(*pixel) {
+            red += u32::from(pixel_red);
+            green += u32::from(pixel_green);
+            blue += u32::from(pixel_blue);
+        }
+    }
+    Color::Rgb(
+        (red / count) as u8,
+        (green / count) as u8,
+        (blue / count) as u8,
+    )
 }
 
 fn pixel_color(pixel: [u8; 4]) -> Color {
@@ -1253,13 +1764,179 @@ fn format_metrics(metrics: Option<&SystemMetrics>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cycle_link, handle_key, link_reference_index, next_form_field, search_searxng,
-        validate_form, FormSession,
+        append_pasted_text, braille_cell, cycle_link, decode_image, handle_key, image_indices,
+        is_current_navigation, is_youtube_video_url, link_reference_index, next_form_field,
+        parse_youtube_search_results, search_searxng, status_indicator, validate_form,
+        youtube_search_query, FormSession, BRAILLE_DOT_BITS,
     };
     use crossterm::event::KeyCode;
     use nyx_core::{AppState, FormField, FormFieldKind, FormMethod, HtmlForm};
     use nyx_pal::{AdapterError, AdapterFuture, FormSubmission, NetworkAdapter, PageResponse};
+    use ratatui::style::Color;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn status_indicators_distinguish_loading_success_and_errors() {
+        let (loading, loading_color) = status_indicator("Loading https://example.com");
+        assert!(["[|]", "[/]", "[-]", "[\\]"].contains(&loading.as_str()));
+        assert_eq!(loading_color, Color::Yellow);
+        assert_eq!(
+            status_indicator("Page loaded."),
+            ("[OK]".to_owned(), Color::Green)
+        );
+        assert_eq!(
+            status_indicator("Page failed: timeout"),
+            ("[ERROR]".to_owned(), Color::Red)
+        );
+        assert_eq!(
+            status_indicator("ignored a malformed Set-Cookie header from the server"),
+            ("[WARN]".to_owned(), Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn recognizes_supported_youtube_video_urls_only() {
+        assert!(is_youtube_video_url(
+            "https://www.youtube.com/watch?v=video-id"
+        ));
+        assert!(is_youtube_video_url("https://youtu.be/video-id"));
+        assert!(is_youtube_video_url(
+            "https://m.youtube.com/shorts/video-id"
+        ));
+        assert!(is_youtube_video_url("https://youtube.com/live/video-id"));
+        assert!(!is_youtube_video_url("https://www.youtube.com/"));
+        assert!(!is_youtube_video_url(
+            "https://example.com/watch?v=video-id"
+        ));
+        assert!(!is_youtube_video_url(
+            "file:///youtube.com/watch?v=video-id"
+        ));
+    }
+
+    #[test]
+    fn identifies_youtube_search_prefix_and_builds_playable_result_urls() {
+        assert_eq!(
+            youtube_search_query("yt: rust language"),
+            Some("rust language")
+        );
+        assert_eq!(
+            youtube_search_query("YT:  nyx browser  "),
+            Some("nyx browser")
+        );
+        assert_eq!(youtube_search_query("youtube video"), None);
+        assert_eq!(youtube_search_query("yt: "), None);
+
+        let results = match parse_youtube_search_results(
+            br#"{"entries":[{"id":"abc_123","title":"A video","description":"A snippet"},{"id":"bad/id","title":"Unsafe"}]}"#,
+        ) {
+            Ok(results) => results,
+            Err(error) => panic!("YouTube results failed to parse: {error}"),
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "A video");
+        assert_eq!(results[0].url, "https://www.youtube.com/watch?v=abc_123");
+        assert_eq!(results[0].snippet, "A snippet");
+    }
+
+    #[test]
+    fn ignores_page_completions_from_previous_navigation() {
+        assert!(is_current_navigation(4, 4));
+        assert!(!is_current_navigation(3, 4));
+    }
+
+    #[test]
+    fn pasted_terminal_text_is_added_without_control_characters() {
+        let mut input = String::new();
+        append_pasted_text(&mut input, "https://youtu.be/abc\r\n");
+        assert_eq!(input, "https://youtu.be/abc");
+    }
+
+    #[test]
+    fn number_keys_are_inserted_into_home_search_and_bookmark_inputs() {
+        let mut state = AppState::default();
+        let mut selected_link = 0;
+        let mut show_help = false;
+        let mut bookmark_focus = false;
+
+        handle_key(
+            KeyCode::Char('3'),
+            &mut state,
+            &mut selected_link,
+            &mut show_help,
+            &mut bookmark_focus,
+        );
+        assert_eq!(state.input, "3");
+
+        bookmark_focus = true;
+        handle_key(
+            KeyCode::Char('7'),
+            &mut state,
+            &mut selected_link,
+            &mut show_help,
+            &mut bookmark_focus,
+        );
+        assert_eq!(state.bookmark_input, "7");
+    }
+
+    #[test]
+    fn braille_image_renderer_maps_all_eight_dots() {
+        assert_eq!(BRAILLE_DOT_BITS, [1, 8, 2, 16, 4, 32, 64, 128]);
+        let black = [0, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        for (index, bit) in BRAILLE_DOT_BITS.iter().enumerate() {
+            let mut pixels = [black; 8];
+            pixels[index] = white;
+            let (glyph, foreground, background) = braille_cell(pixels);
+            assert_eq!(glyph as u32, 0x2800 + u32::from(*bit));
+            assert_eq!(foreground, Color::Rgb(255, 255, 255));
+            assert_eq!(background, Color::Rgb(0, 0, 0));
+        }
+        assert_eq!(
+            braille_cell([white; 8]),
+            ('█', Color::Rgb(255, 255, 255), Color::Rgb(255, 255, 255))
+        );
+        assert_eq!(
+            braille_cell([black; 8]),
+            ('█', Color::Rgb(0, 0, 0), Color::Rgb(0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn decodes_inline_svg_and_reports_non_image_responses() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><rect width="4" height="3" fill="#ff0000"/></svg>"##;
+        let image = match decode_image("https://example.test/logo.svg", svg, 100) {
+            Ok(image) => image,
+            Err(error) => panic!("SVG decoding failed: {error}"),
+        };
+        assert_eq!(image.dimensions(), (4, 3));
+        assert_eq!(
+            decode_image(
+                "https://example.test/image",
+                b"<!doctype html><title>Denied</title>",
+                100,
+            ),
+            Err(
+                "The server returned a web/error document instead of a supported image (example.test/image)."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            decode_image(
+                "https://example.test/invalid.png",
+                b"not actually a png",
+                100,
+            ),
+            Err("Unsupported or unknown image format (example.test/invalid.png); supported: PNG, JPEG, GIF, WebP, SVG.".to_owned())
+        );
+    }
+
+    #[test]
+    fn comic_reader_walks_image_panels_in_both_directions() {
+        assert_eq!(image_indices(0, 4, true), [0, 1, 2, 3]);
+        assert_eq!(image_indices(3, 4, true), [3, 0, 1, 2]);
+        assert_eq!(image_indices(2, 4, false), [2, 1, 0, 3]);
+        assert!(image_indices(0, 0, true).is_empty());
+    }
 
     struct MockSearchNetwork {
         requested: AtomicBool,

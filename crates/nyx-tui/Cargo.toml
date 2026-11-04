@@ -9,6 +9,9 @@ image.workspace = true
 nyx-core = { path = "../nyx-core" }
 nyx-pal = { path = "../nyx-pal" }
 ratatui.workspace = true
+resvg = "0.45"
 rpassword.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+url.workspace = true
 zeroize.workspace = true

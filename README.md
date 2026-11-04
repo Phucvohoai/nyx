@@ -10,7 +10,7 @@ Nyx is an experimental, privacy-minded text browser written in Rust. It presents
 - Navigate directly to HTTP and HTTPS URLs.
 - Extract semantic article content in reading order, with separated link, form, and image references.
 - Submit supported HTML GET/POST forms. Session cookies can be stored in an encrypted local vault.
-- View PNG, JPEG, WebP, and the first frame of GIF images as true-color terminal pixels.
+- View PNG, JPEG, WebP, SVG, and the first frame of GIF images in the terminal using 24-bit color and a high-resolution Braille renderer.
 - Browse using keyboard and mouse controls.
 - Keep core state, HTML parsing, and the platform/network adapter in separate workspace crates.
 
@@ -97,13 +97,14 @@ Nyx's Tor mode uses a Firefox-like User-Agent and omits Chromium client hints, b
 | Key | Action |
 | --- | --- |
 | `Enter` | Submit a search or open the selected link |
+| `Ctrl+V` | Paste text into the active Home input |
 | `Ctrl+L` | Return to the search/home screen |
 | `Ctrl+T` | Toggle direct/Tor networking; requires a running SOCKS5 Tor service |
 | `Tab` / `Shift+Tab` | Cycle through links or form fields |
 | `1`–`9` | Select a visible result or article link |
 | `PageUp` / `PageDown` | Change result pages or scroll |
-| `i` | Open the image viewer on an article page |
-| `Left` / `Right` | Change images while the image viewer is open |
+| `i` | Open the image/comic reader on an article page |
+| `Left` / `Right` | Previous/next readable image or comic panel |
 | `f` | Open a supported form on an article page |
 | `Esc` | Close a modal or go back |
 | `F1` | Toggle help |
@@ -111,6 +112,10 @@ Nyx's Tor mode uses a Firefox-like User-Agent and omits Chromium client hints, b
 | `Ctrl+C` | Quit immediately |
 
 Mouse clicks select results and article link references; the wheel scrolls the page.
+
+The control strip remains visible while viewing an image. It shows the image navigation shortcuts and the status color legend: green `[OK]` for success, yellow `[WAIT/WARN]` for loading or warnings, and red `[ERROR]` for failures.
+
+For web comics, navigate to a chapter page and press `i`; Nyx opens the page images in order. Use `Left`/`Right` to move between panels. Nyx prefers full-resolution lazy-loaded image URLs and `srcset` candidates, skips broken/non-image entries, and sends the chapter page as the image request referrer. Comics that require JavaScript to create their image URLs may not be readable.
 
 ## Workspace
 
@@ -125,7 +130,10 @@ crates/
 
 - HTML forms are limited to standard GET/POST controls; forms that depend on JavaScript, dynamic tokens, CAPTCHA, or complex OAuth may not work.
 - Modern services such as Google sign-in and Gemini web commonly require JavaScript and browser verification, so they are not expected to work in Nyx.
-- Image support covers common `img` elements and lazy-loaded `data-src` URLs. It does not execute page scripts or support every image format or terminal.
+- YouTube's search result may open, but its website and playback require JavaScript and are not supported by Nyx's HTML viewer. Some sites may also send malformed cookies; Nyx ignores those cookies and shows a warning instead of failing to load the page.
+- YouTube playback is not supported. YouTube's site requires JavaScript, but Nyx can still display text-based search results using `yt: your search terms`.
+- Image support covers common `img` elements, lazy-loaded image attributes and `srcset`, and PNG, JPEG, WebP, SVG, and GIF formats. It does not execute page scripts or support every image format or terminal; if a site returns an error page instead of an image, Nyx reports that separately.
+- Still images use a Braille renderer with up to 2×4 source samples per text cell. The renderer uses the terminal's 24-bit foreground/background colors; visible detail is limited by terminal dimensions and font support.
 - A local SearXNG service improves control over search infrastructure, but its upstream search engines may still rate-limit or block requests.
 - Axon OS support is a future goal. The current platform adapter depends on operating-system networking and is not yet ported to Axon.
 

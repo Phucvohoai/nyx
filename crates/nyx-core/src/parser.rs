@@ -16,6 +16,7 @@ pub struct Article {
 pub struct ArticleImage {
     pub url: String,
     pub alt: String,
+    pub referer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +75,9 @@ impl HtmlParser {
         let title_selector = selector("title")?;
         let block_selector = selector("h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, td, th")?;
         let link_selector = selector("a[href]")?;
-        let image_selector = selector("img[src], img[data-src]")?;
+        let image_selector = selector(
+            "img[src], img[data-src], img[data-srcset], img[srcset], img[data-original], img[data-lazy-src]",
+        )?;
         let form_selector = selector("form")?;
         let body_selector = selector("body")?;
         let root_selector = selector("main, article, [role=main]")?;
@@ -140,11 +143,8 @@ impl HtmlParser {
             .flat_map(|root| root.select(&image_selector))
             .filter(|image| !is_in_excluded_context(*image))
             .filter_map(|image| {
-                let source = image
-                    .value()
-                    .attr("data-src")
-                    .or_else(|| image.value().attr("src"))?
-                    .trim();
+                let source = image_source(image)?;
+                let source = source.trim();
                 if source.is_empty() || source.to_ascii_lowercase().starts_with("data:") {
                     return None;
                 }
@@ -155,6 +155,7 @@ impl HtmlParser {
                 Some(ArticleImage {
                     url: url.into(),
                     alt: normalize_text(image.value().attr("alt").into_iter()),
+                    referer: page_url.to_string(),
                 })
             })
             .take(100)
@@ -244,6 +245,37 @@ fn has_block_ancestor(element: ElementRef<'_>) -> bool {
                     | "th"
             )
         })
+}
+
+fn image_source<'a>(image: ElementRef<'a>) -> Option<&'a str> {
+    let value = image.value();
+    value
+        .attr("data-original")
+        .or_else(|| value.attr("data-lazy-src"))
+        .or_else(|| value.attr("data-srcset").and_then(largest_srcset_url))
+        .or_else(|| value.attr("srcset").and_then(largest_srcset_url))
+        .or_else(|| value.attr("data-src"))
+        .or_else(|| value.attr("src"))
+}
+
+fn largest_srcset_url(srcset: &str) -> Option<&str> {
+    srcset
+        .split(',')
+        .filter_map(|candidate| {
+            let mut fields = candidate.split_whitespace();
+            let url = fields.next()?;
+            if url.to_ascii_lowercase().starts_with("data:") {
+                return None;
+            }
+            let descriptor = fields
+                .next()
+                .and_then(|value| value.strip_suffix('w').or_else(|| value.strip_suffix('x')))
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            Some((url, descriptor))
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(url, _)| url)
 }
 
 fn selector(value: &str) -> Result<Selector, ParserError> {
@@ -649,7 +681,35 @@ mod tests {
         assert_eq!(article.images[0].alt, "Page one");
         assert_eq!(article.images[1].url, "https://comics.example/pages/2.webp");
         assert_eq!(article.images[1].alt, "Page two");
+        assert_eq!(
+            article.images[0].referer,
+            "https://comics.example/series/chapter-1"
+        );
         assert!(article.content.contains("[IMAGE 1] Page one"));
         assert!(article.content.contains("[IMAGE 2] Page two"));
+    }
+
+    #[test]
+    fn prefers_full_resolution_comic_images_from_common_lazy_attributes() {
+        let article = match HtmlParser::parse_article_at(
+            r#"
+                <html><body>
+                  <img src="/thumb.jpg" data-src="/lazy.jpg"
+                       srcset="/small.jpg 320w, /large.jpg 1280w"
+                       alt="Panel">
+                  <img data-original="/original.webp" src="/placeholder.gif">
+                </body></html>
+            "#,
+            "https://comics.example/chapter/1",
+        ) {
+            Ok(article) => article,
+            Err(error) => panic!("comic images failed to parse: {error}"),
+        };
+        assert_eq!(article.images.len(), 2);
+        assert_eq!(article.images[0].url, "https://comics.example/large.jpg");
+        assert_eq!(
+            article.images[1].url,
+            "https://comics.example/original.webp"
+        );
     }
 }
