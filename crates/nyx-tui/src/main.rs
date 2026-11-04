@@ -3,7 +3,7 @@ use std::{io, time::Duration};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -12,17 +12,18 @@ use image::{ImageReader, RgbaImage};
 use nyx_core::{
     default_searxng_endpoint, normalize_direct_url, parse_searxng_results, searxng_search_url,
     AppState, AppView, Article, ArticleImage, FormFieldKind, FormMethod, HtmlForm, HtmlParser,
-    SearchResult, RESULTS_PER_PAGE,
+    ReaderBlock, ReaderDocument, ReaderInline, ReaderLinkItem, SearchResult, RESULTS_PER_PAGE,
 };
 use nyx_pal::{
     FormRequestMethod, FormSubmission, NetworkAdapter, StdBackend, SystemAdapter, SystemMetrics,
 };
 use ratatui::{
     backend::CrosstermBackend,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
     Terminal,
 };
 use std::io::Cursor;
@@ -49,6 +50,14 @@ fn is_current_navigation(completion_id: u64, current_id: u64) -> bool {
 struct ImageViewer {
     index: usize,
     image: RgbaImage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkHitbox {
+    link_index: usize,
+    row: u16,
+    column_start: u16,
+    column_end: u16,
 }
 
 enum ActiveModal<'a> {
@@ -226,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut active_navigation = false;
     let mut navigation_id = 0u64;
     let mut active_navigation_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut link_hitboxes = Vec::new();
     let (search_tx, mut search_rx) = mpsc::unbounded_channel::<SearchCompletion>();
     let (page_tx, mut page_rx) = mpsc::unbounded_channel::<PageCompletion>();
 
@@ -259,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         article.links,
                         article.images,
                         article.forms,
+                        article.reader,
                     );
                     state.input.clear();
                     state.bookmark_input.clear();
@@ -282,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tor_configured: backend.tor_proxy_configured(),
                 tor_connected: backend.tor_route_connected(),
             };
-            render(frame, &state, &metrics, context)
+            render(frame, &state, &metrics, context, &mut link_hitboxes)
         })?;
 
         if event::poll(Duration::from_millis(100))? {
@@ -430,6 +441,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                             article.links,
                                                             article.images,
                                                             article.forms,
+                                                            article.reader,
                                                         );
                                                         active_form = None;
                                                         selected_link = 0;
@@ -553,27 +565,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 navigation_id = navigation_id.wrapping_add(1);
                                 let current_navigation_id = navigation_id;
                                 notice = Some(format!("Loading {url}"));
-                                let backend = backend.clone();
-                                let page_tx = page_tx.clone();
-                                active_navigation_task = Some(tokio::spawn(async move {
-                                    let result = async {
-                                        let page = backend
-                                            .fetch_page(&url)
-                                            .await
-                                            .map_err(|error| error.to_string())?;
-                                        let article = HtmlParser::parse_article_at(
-                                            &page.body,
-                                            page.url.as_str(),
-                                        )
-                                        .map_err(|error| error.to_string())?;
-                                        Ok((article, page.warning))
-                                    }
-                                    .await;
-                                    let _ = page_tx.send(PageCompletion {
-                                        navigation_id: current_navigation_id,
-                                        result,
-                                    });
-                                }));
+                                active_navigation_task = Some(spawn_page_load(
+                                    url,
+                                    backend.clone(),
+                                    page_tx.clone(),
+                                    current_navigation_id,
+                                ));
                             }
                         }
                     } else if handle_key(
@@ -601,22 +598,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MouseEventKind::ScrollDown => {
                         state.scroll = state.scroll.saturating_add(3);
                     }
-                    MouseEventKind::Down(_) => match &state.view {
+                    MouseEventKind::Down(MouseButton::Left) => match &state.view {
                         AppView::SearchResults { links, .. } => {
                             let local_row = usize::from(mouse.row.saturating_sub(4));
                             let index = state
                                 .result_page
                                 .saturating_mul(RESULTS_PER_PAGE)
                                 .saturating_add(local_row);
-                            if index < links.len() {
+                            if let Some(result) = links.get(index) {
                                 selected_link = index;
+                                if active_navigation {
+                                    notice = Some(
+                                        "Wait for the current page load to finish.".to_owned(),
+                                    );
+                                } else {
+                                    active_navigation = true;
+                                    navigation_id = navigation_id.wrapping_add(1);
+                                    notice = Some(format!("Loading {}", result.url));
+                                    active_navigation_task = Some(spawn_page_load(
+                                        result.url.clone(),
+                                        backend.clone(),
+                                        page_tx.clone(),
+                                        navigation_id,
+                                    ));
+                                }
                             }
                         }
-                        AppView::ArticleReader { content, links, .. } => {
-                            let row = usize::from(mouse.row.saturating_sub(4));
-                            if let Some(index) = link_reference_at(content, state.scroll, row) {
-                                if index < links.len() {
-                                    selected_link = index;
+                        AppView::ArticleReader { links, .. } => {
+                            if active_form.is_none() && image_viewer.is_none() {
+                                if let Some(link_index) =
+                                    hit_test_link(&link_hitboxes, mouse.column, mouse.row)
+                                {
+                                    if let Some(url) = links.get(link_index) {
+                                        selected_link = link_index;
+                                        if active_navigation {
+                                            notice = Some(
+                                                "Wait for the current page load to finish."
+                                                    .to_owned(),
+                                            );
+                                        } else {
+                                            active_navigation = true;
+                                            navigation_id = navigation_id.wrapping_add(1);
+                                            notice = Some(format!("Loading {url}"));
+                                            active_navigation_task = Some(spawn_page_load(
+                                                url.clone(),
+                                                backend.clone(),
+                                                page_tx.clone(),
+                                                navigation_id,
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -636,12 +667,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn link_reference_at(content: &str, scroll: u16, visible_row: usize) -> Option<usize> {
-    let line_index = usize::from(scroll).checked_add(visible_row)?;
-    let line = content.lines().nth(line_index)?;
-    let reference = line.strip_prefix("[LINK ")?;
-    let (number, _) = reference.split_once(']')?;
-    number.parse::<usize>().ok()?.checked_sub(1)
+fn spawn_page_load(
+    url: String,
+    backend: StdBackend,
+    page_tx: mpsc::UnboundedSender<PageCompletion>,
+    navigation_id: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = async {
+            let page = backend
+                .fetch_page(&url)
+                .await
+                .map_err(|error| error.to_string())?;
+            let article = HtmlParser::parse_article_at(&page.body, page.url.as_str())
+                .map_err(|error| error.to_string())?;
+            Ok((article, page.warning))
+        }
+        .await;
+        let _ = page_tx.send(PageCompletion {
+            navigation_id,
+            result,
+        });
+    })
 }
 
 fn is_youtube_video_url(value: &str) -> bool {
@@ -1160,7 +1207,9 @@ fn render(
     state: &AppState,
     metrics: &SystemMetrics,
     context: UiContext<'_>,
+    link_hitboxes: &mut Vec<LinkHitbox>,
 ) {
+    link_hitboxes.clear();
     let UiContext {
         selected_link,
         show_help,
@@ -1232,7 +1281,7 @@ fn render(
                 )),
                 Line::from(""),
                 Line::from("Enter a search or URL in the header input and press Enter."),
-                Line::from("Search YouTube videos with: yt: your search terms"),
+                // Line::from("Search YouTube videos with: yt: your search terms"),
                 Line::from(""),
                 Line::from("Quick bookmarks: enter a URL below and press Enter to open it."),
                 Line::from(format!(
@@ -1297,24 +1346,13 @@ fn render(
         }
         AppView::ArticleReader {
             title,
-            content,
             links,
             images,
             forms,
+            reader,
+            ..
         } => {
-            let lines = content
-                .lines()
-                .map(|line| {
-                    let style = if link_reference_index(line) == Some(selected_link) {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    Line::from(Span::styled(line.to_owned(), style))
-                })
-                .collect::<Vec<_>>();
+            let lines = render_reader_document(reader, selected_link);
             let focused_link = links.get(selected_link).map_or_else(
                 || "[f] Fill form".to_owned(),
                 |url| {
@@ -1330,11 +1368,14 @@ fn render(
                 .block(
                     Block::default()
                         .title(format!("{title}  [f] Fill form ({})", forms.len()))
-                        .borders(Borders::ALL),
+                        .borders(Borders::ALL)
+                        .padding(Padding::horizontal(2)),
                 )
                 .wrap(Wrap { trim: true })
                 .scroll((state.scroll, 0));
             frame.render_widget(article, areas[1]);
+            *link_hitboxes =
+                collect_link_hitboxes(frame.buffer_mut(), areas[1], links.len(), selected_link);
             frame.render_widget(Paragraph::new(focused_link), control_areas[0]);
         }
     }
@@ -1385,7 +1426,7 @@ fn render(
         let area = centered_rect(60, 40, frame.size());
         frame.render_widget(
             Paragraph::new(
-                "Keyboard: Enter searches or opens the selected link. Ctrl+V pastes on Home; Ctrl+L returns Home; Ctrl+T toggles Tor. Up/Down selects results or scrolls; PgUp/PgDn changes pages or scrolls. Tab/Shift+Tab cycles links and form fields; 1-9 selects a result/link. Press i to view article images (Left/Right changes image, Esc closes), f to fill a form, F1 for help, and q/Ctrl+C to quit.\nStatus colors: green [OK] means success; yellow [WAIT/WARN] means loading or warning; red [ERROR] means failure.\nYouTube text search uses \"yt: words\"; video playback is not supported. Tor must already be running; Nyx blocks network requests if its configured Tor route is unavailable.\nMouse: click a result or [LINK N] reference to select it; use the wheel to scroll.",
+                "Keyboard: Enter searches or opens the selected link. Ctrl+V pastes on Home; Ctrl+L returns Home; Ctrl+T toggles Tor. Up/Down selects results or scrolls; PgUp/PgDn changes pages or scrolls. Tab/Shift+Tab cycles links and form fields; 1-9 selects a result/link. Press i to view article images (Left/Right changes image, Esc closes), f to fill a form, F1 for help, and q/Ctrl+C to quit.\nStatus colors: green [OK] means success; yellow [WAIT/WARN] means loading or warning; red [ERROR] means failure.\nYouTube text search uses \"yt: words\"; video playback is not supported. Tor must already be running; Nyx blocks network requests if its configured Tor route is unavailable.\nMouse: left-click a search result or rendered article link to open it; use the wheel to scroll.",
             )
             .block(Block::default().title("Nyx Help").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
@@ -1713,10 +1754,248 @@ fn cycle_link(current: usize, link_count: usize, forward: bool) -> Option<usize>
     }
 }
 
-fn link_reference_index(line: &str) -> Option<usize> {
-    let reference = line.strip_prefix("[LINK ")?;
-    let (number, _) = reference.split_once(']')?;
-    number.parse::<usize>().ok()?.checked_sub(1)
+fn link_marker_background(link_index: usize) -> Option<Color> {
+    let encoded = u32::try_from(link_index).ok()?.checked_add(1)?;
+    (encoded <= 0x00ff_ffff).then_some(Color::Rgb(
+        ((encoded >> 16) & 0xff) as u8,
+        ((encoded >> 8) & 0xff) as u8,
+        (encoded & 0xff) as u8,
+    ))
+}
+
+fn link_index_from_marker(color: Color, link_count: usize) -> Option<usize> {
+    let Color::Rgb(red, green, blue) = color else {
+        return None;
+    };
+    let encoded = (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
+    let index = usize::try_from(encoded.checked_sub(1)?).ok()?;
+    (index < link_count).then_some(index)
+}
+
+fn hit_test_link(hitboxes: &[LinkHitbox], column: u16, row: u16) -> Option<usize> {
+    hitboxes
+        .iter()
+        .find(|hitbox| {
+            hitbox.row == row && column >= hitbox.column_start && column < hitbox.column_end
+        })
+        .map(|hitbox| hitbox.link_index)
+}
+
+fn collect_link_hitboxes(
+    buffer: &mut Buffer,
+    area: ratatui::layout::Rect,
+    link_count: usize,
+    selected_link: usize,
+) -> Vec<LinkHitbox> {
+    let mut hitboxes = Vec::new();
+    for row in area.y..area.y.saturating_add(area.height) {
+        let mut current: Option<LinkHitbox> = None;
+        for column in area.x..area.x.saturating_add(area.width) {
+            let cell = buffer.get_mut(column, row);
+            let link_index = link_index_from_marker(cell.bg, link_count);
+            if let Some(link_index) = link_index {
+                cell.set_bg(if link_index == selected_link {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                });
+            }
+
+            match (current.as_mut(), link_index) {
+                (Some(hitbox), Some(link_index))
+                    if hitbox.link_index == link_index && hitbox.column_end == column =>
+                {
+                    hitbox.column_end = column.saturating_add(1);
+                }
+                _ => {
+                    if let Some(hitbox) = current.take() {
+                        hitboxes.push(hitbox);
+                    }
+                    if let Some(link_index) = link_index {
+                        current = Some(LinkHitbox {
+                            link_index,
+                            row,
+                            column_start: column,
+                            column_end: column.saturating_add(1),
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(hitbox) = current {
+            hitboxes.push(hitbox);
+        }
+    }
+    hitboxes
+}
+
+fn render_reader_document(document: &ReaderDocument, selected_link: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(byline) = &document.byline {
+        lines.push(Line::from(Span::styled(
+            byline.clone(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for (block_index, block) in document.blocks.iter().enumerate() {
+        match block {
+            ReaderBlock::Heading { level, content } => {
+                let style = match level {
+                    1 => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    2 => Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                    _ => Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                };
+                lines.push(Line::from(render_reader_inlines(
+                    content,
+                    selected_link,
+                    style,
+                )));
+                lines.push(Line::from(""));
+            }
+            ReaderBlock::Paragraph(content) => {
+                lines.push(Line::from(render_reader_inlines(
+                    content,
+                    selected_link,
+                    Style::default().fg(Color::White),
+                )));
+                lines.push(Line::from(""));
+            }
+            ReaderBlock::Blockquote(content) => {
+                let mut spans = vec![Span::styled(
+                    "│ ",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(render_reader_inlines(
+                    content,
+                    selected_link,
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+                lines.push(Line::from(spans));
+                lines.push(Line::from(""));
+            }
+            ReaderBlock::List { ordered, items } => {
+                for (item_index, item) in items.iter().enumerate() {
+                    let marker = if *ordered {
+                        format!("  {}. ", item_index + 1)
+                    } else {
+                        "  • ".to_owned()
+                    };
+                    let mut spans = vec![Span::styled(
+                        marker,
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    )];
+                    spans.extend(render_reader_inlines(
+                        item,
+                        selected_link,
+                        Style::default().fg(Color::White),
+                    ));
+                    lines.push(Line::from(spans));
+                }
+                lines.push(Line::from(""));
+            }
+            ReaderBlock::LinkList(items) => {
+                for item in items {
+                    lines.push(render_reader_link_item(item, selected_link));
+                }
+                lines.push(Line::from(""));
+            }
+            ReaderBlock::Code(code) => {
+                for code_line in code.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {code_line}"),
+                        Style::default().fg(Color::LightYellow),
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
+        }
+
+        if block_index + 1 == document.blocks.len() {
+            while lines.last().is_some_and(|line| line.spans.is_empty()) {
+                lines.pop();
+            }
+        }
+    }
+    lines
+}
+
+fn render_reader_link_item(item: &ReaderLinkItem, selected_link: usize) -> Line<'static> {
+    let marker_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let marker_background = link_marker_background(item.link_index).unwrap_or(Color::Reset);
+    let title_style = if item.link_index == selected_link {
+        Style::default()
+            .fg(Color::Black)
+            .bg(marker_background)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .fg(Color::LightBlue)
+            .bg(marker_background)
+            .add_modifier(Modifier::UNDERLINED)
+    };
+    Line::from(vec![
+        Span::styled(format!("[{}] ", item.link_index + 1), marker_style),
+        Span::styled(item.text.clone(), title_style),
+    ])
+}
+
+fn render_reader_inlines(
+    content: &[ReaderInline],
+    selected_link: usize,
+    text_style: Style,
+) -> Vec<Span<'static>> {
+    content
+        .iter()
+        .flat_map(|inline| match inline {
+            ReaderInline::Text(text) => vec![Span::styled(text.clone(), text_style)],
+            ReaderInline::Code(code) => vec![Span::styled(
+                code.clone(),
+                Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+            )],
+            ReaderInline::Link { text, link_index } => {
+                let marker_background = link_marker_background(*link_index).unwrap_or(Color::Reset);
+                let link_style = if *link_index == selected_link {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(marker_background)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .bg(marker_background)
+                        .add_modifier(Modifier::UNDERLINED)
+                };
+                vec![
+                    Span::styled(text.clone(), link_style),
+                    Span::styled(
+                        format!(" [Link #{}]", link_index + 1),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .bg(marker_background)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]
+            }
+        })
+        .collect()
 }
 
 fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -1764,15 +2043,20 @@ fn format_metrics(metrics: Option<&SystemMetrics>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_pasted_text, braille_cell, cycle_link, decode_image, handle_key, image_indices,
-        is_current_navigation, is_youtube_video_url, link_reference_index, next_form_field,
-        parse_youtube_search_results, search_searxng, status_indicator, validate_form,
+        append_pasted_text, braille_cell, collect_link_hitboxes, cycle_link, decode_image,
+        handle_key, hit_test_link, image_indices, is_current_navigation, is_youtube_video_url,
+        link_marker_background, next_form_field, parse_youtube_search_results,
+        render_reader_document, search_searxng, status_indicator, validate_form,
         youtube_search_query, FormSession, BRAILLE_DOT_BITS,
     };
     use crossterm::event::KeyCode;
-    use nyx_core::{AppState, FormField, FormFieldKind, FormMethod, HtmlForm};
+    use nyx_core::{
+        AppState, FormField, FormFieldKind, FormMethod, HtmlForm, ReaderBlock, ReaderDocument,
+        ReaderInline, ReaderLinkItem,
+    };
     use nyx_pal::{AdapterError, AdapterFuture, FormSubmission, NetworkAdapter, PageResponse};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
+    use ratatui::{buffer::Buffer, layout::Rect};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -1849,6 +2133,64 @@ mod tests {
         let mut input = String::new();
         append_pasted_text(&mut input, "https://youtu.be/abc\r\n");
         assert_eq!(input, "https://youtu.be/abc");
+    }
+
+    #[test]
+    fn reader_mode_renders_structured_blocks_and_selected_inline_links() {
+        let document = ReaderDocument {
+            title: "Article".to_owned(),
+            byline: Some("By Nyx".to_owned()),
+            links: vec!["https://example.test".to_owned()],
+            blocks: vec![
+                ReaderBlock::Heading {
+                    level: 1,
+                    content: vec![ReaderInline::Text("Chapter title".to_owned())],
+                },
+                ReaderBlock::Paragraph(vec![
+                    ReaderInline::Text("Read ".to_owned()),
+                    ReaderInline::Link {
+                        text: "this".to_owned(),
+                        link_index: 0,
+                    },
+                    ReaderInline::Code("<p>".to_owned()),
+                ]),
+                ReaderBlock::List {
+                    ordered: false,
+                    items: vec![vec![ReaderInline::Text("First item".to_owned())]],
+                },
+                ReaderBlock::LinkList(vec![ReaderLinkItem {
+                    text: "A story title".to_owned(),
+                    link_index: 1,
+                }]),
+            ],
+        };
+        let lines = render_reader_document(&document, 0);
+
+        assert_eq!(lines[0].spans[0].content, "By Nyx");
+        assert_eq!(lines[2].spans[0].content, "Chapter title");
+        assert!(lines[2].spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(lines[4].spans[1].content, "this");
+        assert_eq!(lines[4].spans[1].style.bg, link_marker_background(0));
+        assert_eq!(lines[4].spans[2].content, " [Link #1]");
+        assert_eq!(lines[4].spans[3].content, "<p>");
+        assert_eq!(lines[4].spans[3].style.fg, Some(Color::LightYellow));
+        assert!(lines.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("First item"))));
+        let index_link = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .first()
+                    .is_some_and(|span| span.content == "[2] ")
+            })
+            .expect("index link should render as a numbered list item");
+        assert_eq!(index_link.spans[1].content, "A story title");
+        assert_eq!(index_link.spans[1].style.fg, Some(Color::LightBlue));
     }
 
     #[test]
@@ -2053,10 +2395,16 @@ mod tests {
         let mut state = AppState::default();
         state.open_article(
             "Article".to_owned(),
-            "[LINK 1] https://one.test\n[LINK 2] https://two.test".to_owned(),
+            "One [Link #1]\nTwo [Link #2]".to_owned(),
             vec!["https://one.test".to_owned(), "https://two.test".to_owned()],
             Vec::new(),
             Vec::new(),
+            ReaderDocument {
+                title: "Article".to_owned(),
+                byline: None,
+                blocks: Vec::new(),
+                links: vec!["https://one.test".to_owned(), "https://two.test".to_owned()],
+            },
         );
         let mut selected_link = 0;
         let mut show_help = false;
@@ -2098,8 +2446,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_link_reference_index() {
-        assert_eq!(link_reference_index("[LINK 3] https://three.test"), Some(2));
-        assert_eq!(link_reference_index("article content"), None);
+    fn mouse_hit_testing_uses_exact_rendered_link_cells() {
+        let area = Rect::new(2, 3, 12, 4);
+        let mut buffer = Buffer::empty(area);
+        let first = link_marker_background(0).expect("first link marker color");
+        let second = link_marker_background(1).expect("second link marker color");
+        for column in 5..9 {
+            buffer.get_mut(column, 4).set_bg(first);
+        }
+        for column in 8..11 {
+            buffer.get_mut(column, 5).set_bg(second);
+        }
+
+        let hitboxes = collect_link_hitboxes(&mut buffer, area, 2, 1);
+        assert_eq!(hit_test_link(&hitboxes, 5, 4), Some(0));
+        assert_eq!(hit_test_link(&hitboxes, 8, 4), Some(0));
+        assert_eq!(hit_test_link(&hitboxes, 8, 5), Some(1));
+        assert_eq!(hit_test_link(&hitboxes, 11, 5), None);
+        assert_eq!(buffer.get(5, 4).bg, Color::Reset);
+        assert_eq!(buffer.get(8, 5).bg, Color::Yellow);
     }
 }

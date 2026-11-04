@@ -4,6 +4,7 @@ mod state;
 
 pub use parser::{
     Article, ArticleImage, FormField, FormFieldKind, FormMethod, HtmlForm, HtmlParser, ParserError,
+    ReaderBlock, ReaderDocument, ReaderInline, ReaderLinkItem,
 };
 pub use search::{
     default_searxng_endpoint, duckduckgo_search_endpoint, duckduckgo_search_url,

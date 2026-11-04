@@ -1,4 +1,4 @@
-use crate::{ArticleImage, HtmlForm};
+use crate::{ArticleImage, HtmlForm, ReaderDocument};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
@@ -20,6 +20,7 @@ pub enum AppView {
         links: Vec<String>,
         images: Vec<ArticleImage>,
         forms: Vec<HtmlForm>,
+        reader: ReaderDocument,
     },
 }
 
@@ -85,6 +86,7 @@ impl AppState {
         links: Vec<String>,
         images: Vec<ArticleImage>,
         forms: Vec<HtmlForm>,
+        reader: ReaderDocument,
     ) {
         self.push_view(AppView::ArticleReader {
             title,
@@ -92,6 +94,7 @@ impl AppState {
             links,
             images,
             forms,
+            reader,
         });
     }
 
@@ -126,6 +129,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{AppState, AppView};
+    use crate::ReaderDocument;
 
     #[test]
     fn search_submission_and_back_navigation_preserve_view_history() {
@@ -168,6 +172,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            ReaderDocument {
+                title: "Article".to_owned(),
+                byline: None,
+                blocks: Vec::new(),
+                links: Vec::new(),
+            },
         );
         state.go_home();
         state.go_back();

@@ -8,7 +8,7 @@ Nyx is an experimental, privacy-minded text browser written in Rust. It presents
 
 - Search through a SearXNG JSON API, with a local instance as the default.
 - Navigate directly to HTTP and HTTPS URLs.
-- Extract semantic article content in reading order, with separated link, form, and image references.
+- Extract a structured reader document with semantic headings, paragraphs, lists, quotations, bylines, and navigable links. Links stay inline in article prose; link-dense aggregator pages are rendered as compact numbered lists. Forms and images remain available through dedicated controls rather than cluttering the reading text.
 - Submit supported HTML GET/POST forms. Session cookies can be stored in an encrypted local vault.
 - View PNG, JPEG, WebP, SVG, and the first frame of GIF images in the terminal using 24-bit color and a high-resolution Braille renderer.
 - Browse using keyboard and mouse controls.
@@ -111,7 +111,7 @@ Nyx's Tor mode uses a Firefox-like User-Agent and omits Chromium client hints, b
 | `q` | Quit |
 | `Ctrl+C` | Quit immediately |
 
-Mouse clicks select results and article link references; the wheel scrolls the page.
+Reader Mode renders article links inline as `[Link #N]` and aggregator entries as numbered titles; use `Tab`/`Shift+Tab` or `1`–`9` to select one and `Enter` to open it. Left-click a search result or rendered article link to open it directly; the wheel scrolls the page.
 
 The control strip remains visible while viewing an image. It shows the image navigation shortcuts and the status color legend: green `[OK]` for success, yellow `[WAIT/WARN]` for loading or warnings, and red `[ERROR]` for failures.
 

@@ -444,7 +444,7 @@ impl StdBackend {
                 if proxy_url.is_some() {
                     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
                 } else {
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
                 },
             ),
         );
@@ -453,7 +453,7 @@ impl StdBackend {
             HeaderValue::from_static(if proxy_url.is_some() {
                 "en-US,en;q=0.5"
             } else {
-                "en-US,en;q=0.9"
+                "en-US,en;q=0.9,vi;q=0.8"
             }),
         );
         if proxy_url.is_none() {
@@ -468,6 +468,10 @@ impl StdBackend {
                 "sec-ch-ua-platform",
                 HeaderValue::from_static("\"Windows\""),
             );
+            default_headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
+            default_headers.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+            default_headers.insert("sec-fetch-user", HeaderValue::from_static("?1"));
+            default_headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
         }
         let mut builder = Client::builder()
             .default_headers(default_headers)
